@@ -1,0 +1,10 @@
+{
+  "name": "quota-gate",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "In-process quota gate with fair backpressure",
+  "main": "src/index.js",
+  "scripts": { "test": "node --test" },
+  "engines": { "node": ">=20" }
+}
