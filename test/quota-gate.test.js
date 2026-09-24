@@ -14,6 +14,7 @@ test('stats exposes the documented keys in order', () => {
     'granted',
     'refused',
     'expired',
+    'cancelled',
   ]);
   assert.deepEqual(gate.stats(), {
     limit: 2,
@@ -23,6 +24,7 @@ test('stats exposes the documented keys in order', () => {
     granted: 0,
     refused: 0,
     expired: 0,
+    cancelled: 0,
   });
 });
 
@@ -297,4 +299,232 @@ test('limit of one serializes the whole hierarchy', async () => {
     assert.equal(err.code, 'QUOTA_EXCEEDED');
     return true;
   });
+});
+
+test('updateLimit validates its argument and the hierarchy bounds', () => {
+  const parent = createGate({ limit: 5, windowMs: 1000 });
+  const child = createGate({ limit: 3, windowMs: 1000, parent });
+  assert.throws(() => child.updateLimit('4'), TypeError);
+  assert.throws(() => child.updateLimit(2.5), TypeError);
+  assert.throws(() => child.updateLimit(0), RangeError);
+  assert.throws(() => child.updateLimit(-2), RangeError);
+  assert.throws(() => child.updateLimit(6), RangeError); // above the direct parent
+  assert.throws(() => parent.updateLimit(2), RangeError); // below the direct child
+  child.updateLimit(4);
+  assert.equal(child.stats().limit, 4);
+  parent.updateLimit(4); // now allowed: no child exceeds 4
+  assert.equal(parent.stats().limit, 4);
+});
+
+test('updateLimit shrink rejects queued requests that no longer fit', async () => {
+  const gate = createGate({ limit: 3, windowMs: 60, maxWaitMs: 1000 });
+  await gate.acquire(3); // window full
+  const big = gate.acquire(2).then((h) => h, (err) => err);
+  const small = gate.acquire(1).then((h) => h);
+  assert.equal(gate.stats().waiting, 3);
+  gate.updateLimit(1);
+  const bigResult = await big;
+  assert.ok(bigResult instanceof QuotaExceededError);
+  assert.equal(bigResult.code, 'QUOTA_EXCEEDED');
+  assert.equal(gate.stats().refused, 1);
+  assert.equal(gate.stats().waiting, 1); // only the still-fitting request remains
+  const h = await small; // the dead head no longer blocks it
+  assert.equal(gate.stats().granted, 2);
+  h.release();
+});
+
+test('updateLimit grow does not release queued requests early', async () => {
+  const gate = createGate({ limit: 1, windowMs: 60, maxWaitMs: 1000 });
+  await gate.acquire(1);
+  const p = gate.acquire(1);
+  gate.updateLimit(2);
+  assert.equal(gate.stats().limit, 2);
+  assert.equal(gate.stats().waiting, 1); // still queued until the flip
+  const h = await p;
+  assert.equal(gate.stats().granted, 2);
+  h.release();
+});
+
+test('updateWindowMs restarts the current window with the new length', async () => {
+  const gate = createGate({ limit: 1, windowMs: 1000, maxWaitMs: 2000 });
+  const first = await gate.acquire(1);
+  const p = gate.acquire(1);
+  const start = Date.now();
+  gate.updateWindowMs(50);
+  assert.equal(gate.stats().windowMs, 50);
+  assert.equal(gate.stats().inFlight, 1); // used quota is not cleared
+  const h = await p; // granted one new-length window after the adjustment
+  assert.ok(Date.now() - start < 500, 'flip happens after the new length, not the old');
+  assert.equal(gate.stats().granted, 2);
+  first.release();
+  h.release();
+  assert.throws(() => gate.updateWindowMs(0), RangeError);
+  assert.throws(() => gate.updateWindowMs(-5), RangeError);
+  assert.throws(() => gate.updateWindowMs(1.5), TypeError);
+});
+
+test('updateMaxWaitMs re-deadlines queued waiters and expires overdue ones', async () => {
+  const gate = createGate({ limit: 1, windowMs: 1000, maxWaitMs: 1000 });
+  await gate.acquire(1);
+  const p = gate.acquire(1).then((h) => h, (err) => err);
+  await sleep(40);
+  gate.updateMaxWaitMs(10); // deadline = enqueue time + 10, already past
+  const err = await p;
+  assert.equal(err.code, 'WAIT_EXPIRED');
+  assert.equal(gate.stats().expired, 1);
+  assert.equal(gate.stats().waiting, 0);
+
+  const gate2 = createGate({ limit: 1, windowMs: 60, maxWaitMs: 20 });
+  await gate2.acquire(1);
+  const p2 = gate2.acquire(1); // would expire at +20, before the 60ms flip
+  gate2.updateMaxWaitMs(1000); // re-deadlined to enqueue time + 1000
+  const h2 = await p2; // survives to the flip and is granted
+  assert.equal(gate2.stats().granted, 2);
+  h2.release();
+
+  assert.throws(() => gate.updateMaxWaitMs(-1), RangeError);
+  assert.throws(() => gate.updateMaxWaitMs(0.5), TypeError);
+});
+
+test('reparent validates the target, ancestry and limit without a facet', () => {
+  const root = createGate({ limit: 3, windowMs: 1000 });
+  const child = createGate({ limit: 2, windowMs: 1000, parent: root });
+  const grand = createGate({ limit: 1, windowMs: 1000, parent: child });
+  const before = child.stats();
+  assert.throws(() => child.reparent({}), TypeError);
+  assert.throws(() => child.reparent('gate'), TypeError);
+  assert.throws(() => child.reparent(child), RangeError); // itself
+  assert.throws(() => child.reparent(grand), RangeError); // its descendant
+  const small = createGate({ limit: 1, windowMs: 1000 });
+  assert.throws(() => child.reparent(small), RangeError); // limit above new parent
+  assert.deepEqual(child.stats(), before); // failed attempts produce no facet
+});
+
+test('reparent settles the pool draw across families in one snapshot', async () => {
+  const root1 = createGate({ limit: 2, windowMs: 1000 });
+  const child = createGate({ limit: 2, windowMs: 1000, parent: root1 });
+  const root2 = createGate({ limit: 5, windowMs: 1000 });
+  await child.acquire(2); // draws the whole old family pool
+  await assert.rejects(root1.acquire(1), (err) => err.code === 'QUOTA_EXCEEDED');
+  const before = root1.stats();
+  child.reparent(root2);
+  assert.deepEqual(root1.stats(), before); // the old parent shows no facet
+  assert.equal(child.stats().inFlight, 2); // admitted occupations are not broken
+  const h1 = await root1.acquire(2); // the old pool was settled back
+  await assert.rejects(root2.acquire(4), (err) => err.code === 'QUOTA_EXCEEDED'); // 2 of 5 re-borrowed
+  const h2 = await root2.acquire(3);
+  h1.release();
+  h2.release();
+});
+
+test('reparent refuses and rolls back when the new pool cannot cover the draw', async () => {
+  const root1 = createGate({ limit: 3, windowMs: 1000 });
+  const child = createGate({ limit: 2, windowMs: 1000, parent: root1 });
+  await child.acquire(2);
+  const root2 = createGate({ limit: 3, windowMs: 1000 });
+  await root2.acquire(2); // only 1 left in the new family pool
+  assert.throws(
+    () => child.reparent(root2),
+    (err) => {
+      assert.ok(err instanceof QuotaExceededError);
+      assert.equal(err.code, 'QUOTA_EXCEEDED');
+      return true;
+    },
+  );
+  // Fully rolled back: the child still belongs to the old family.
+  const h1 = await root1.acquire(1); // old pool still 2 of 3
+  await assert.rejects(root1.acquire(1), (err) => err.code === 'QUOTA_EXCEEDED');
+  const h2 = await root2.acquire(1); // new pool untouched: 2 of 3 + 1
+  await assert.rejects(root2.acquire(1), (err) => err.code === 'QUOTA_EXCEEDED');
+  assert.equal(child.stats().inFlight, 2);
+  h1.release();
+  h2.release();
+});
+
+test('reparent carries descendants and queued waiters to the new family', async () => {
+  const root1 = createGate({ limit: 1, windowMs: 1000, maxWaitMs: 1000 });
+  const child = createGate({ limit: 1, windowMs: 1000, maxWaitMs: 1000, parent: root1 });
+  const grand = createGate({ limit: 1, windowMs: 1000, maxWaitMs: 1000, parent: child });
+  const root2 = createGate({ limit: 2, windowMs: 60 });
+  await root1.acquire(1); // old pool full
+  let granted = false;
+  const p = grand.acquire(1).then((h) => {
+    granted = true;
+    return h;
+  }); // queued on the old family
+  child.reparent(root2);
+  assert.equal(grand.stats().waiting, 1); // still queued: never granted early
+  assert.equal(granted, false);
+  await sleep(150); // the new family's 60ms window flips
+  assert.equal(granted, true); // served by the new family's window
+  const h = await p;
+  h.release();
+});
+
+test('reparent within the same family keeps the pool and queue intact', async () => {
+  const root = createGate({ limit: 3, windowMs: 1000 });
+  const a = createGate({ limit: 2, windowMs: 1000, parent: root });
+  const b = createGate({ limit: 2, windowMs: 1000, parent: root });
+  await a.acquire(2);
+  a.reparent(b); // same root: the pool draw stays put
+  await root.acquire(1); // pool still 2 of 3 used
+  await assert.rejects(root.acquire(1), (err) => err.code === 'QUOTA_EXCEEDED');
+  assert.equal(a.stats().inFlight, 2);
+});
+
+test('aborting a queued acquire settles it as CANCELLED and unblocks the queue', async () => {
+  const gate = createGate({ limit: 1, windowMs: 60, maxWaitMs: 1000 });
+  const first = await gate.acquire(1);
+  const controller = new AbortController();
+  const p1 = gate.acquire(1, { signal: controller.signal });
+  const p2 = gate.acquire(1);
+  assert.equal(gate.stats().waiting, 2);
+  controller.abort();
+  await assert.rejects(p1, (err) => {
+    assert.ok(err instanceof QuotaExceededError);
+    assert.equal(err.code, 'CANCELLED');
+    return true;
+  });
+  assert.equal(gate.stats().waiting, 1);
+  assert.equal(gate.stats().cancelled, 1);
+  assert.equal(gate.stats().expired, 0);
+  const h2 = await p2; // granted at the next flip; the cancelled entry is gone
+  assert.equal(gate.stats().granted, 2);
+  first.release();
+  h2.release();
+});
+
+test('an already-aborted signal settles immediately without queueing', async () => {
+  const gate = createGate({ limit: 1, windowMs: 1000, maxWaitMs: 1000 });
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(gate.acquire(1, controller.signal), (err) => {
+    assert.ok(err instanceof QuotaExceededError);
+    assert.equal(err.code, 'CANCELLED');
+    return true;
+  });
+  assert.equal(gate.stats().cancelled, 1);
+  assert.equal(gate.stats().waiting, 0);
+  assert.equal(gate.stats().granted, 0);
+});
+
+test('cancelling a granted or settled acquire does not count', async () => {
+  const gate = createGate({ limit: 2, windowMs: 1000, maxWaitMs: 1000 });
+  const c1 = new AbortController();
+  const h = await gate.acquire(1, { signal: c1.signal }); // granted at once
+  c1.abort(); // too late: the occupation is already granted
+  assert.equal(gate.stats().cancelled, 0);
+  assert.equal(gate.stats().inFlight, 1);
+  h.release();
+
+  const gate2 = createGate({ limit: 1, windowMs: 1000, maxWaitMs: 20 });
+  await gate2.acquire(1);
+  const c2 = new AbortController();
+  const p = gate2.acquire(1, { signal: c2.signal }).then((h) => h, (err) => err);
+  await sleep(50); // the wait already expired
+  c2.abort(); // too late: already settled
+  const err = await p;
+  assert.equal(err.code, 'WAIT_EXPIRED');
+  assert.equal(gate2.stats().cancelled, 0);
+  assert.equal(gate2.stats().expired, 1);
 });
