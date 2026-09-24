@@ -262,6 +262,14 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     return true;
   }
 
+  // Same whole reservation for one gate: the entry's own current-window slice,
+  // lends up the direct parent chain, then the root pool. A single-gate
+  // occupation gathers exactly the way a one-member combo would — its own
+  // limit never caps the request, only the family pool does.
+  function tryGatherOne(entry, g, units) {
+    return tryGather(entry, buildSegs([g], () => units));
+  }
+
   // Release a held reservation wholesale. Pool room is refunded only while
   // the charged pool window is still the current one; a pool flip already
   // reclaimed it (the link is marked released and its gen is stale).
@@ -335,43 +343,6 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
         }
       },
     };
-  }
-
-  // Commit a single-gate occupation with the baseline partition: own quota
-  // first, every shortfall drawn straight from the root pool.
-  function commitSingle(target, units) {
-    const r = target.root;
-    r.poolUsed += units;
-    chargeDraw(target, units);
-    let seg;
-    if (target === r) {
-      target.usedOwn += units;
-      target.inFlight += units;
-      seg = { member: target, units, own: units, mgen: target.ownGen, links: [] };
-    } else {
-      const ownPart = Math.min(units, Math.max(0, target.limit - target.usedOwn));
-      const borrowPart = units - ownPart;
-      target.usedOwn += ownPart;
-      target.inFlight += units;
-      target.borrowedInFlight += borrowPart;
-      const links = [];
-      if (borrowPart > 0) {
-        const link = {
-          kind: 'pool',
-          lender: r,
-          member: target,
-          units: borrowPart,
-          lgen: r.poolGen,
-          mgen: target.ownGen,
-        };
-        r.poolLinks.add(link);
-        links.push(link);
-      }
-      seg = { member: target, units, own: ownPart, mgen: target.ownGen, links };
-    }
-    const rec = { seg };
-    target.openHandles.add(rec);
-    return makeHandle([rec]);
   }
 
   // Commit a fully gathered combo: provisional promises become admitted
@@ -463,14 +434,16 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     detachSignal(entry);
     for (const charge of entry.waitCharges) charge.gate.waiting -= charge.units;
     if (outcome === 'granted') {
-      const handle = entry.combo ? commitCombo(entry) : commitSingle(entry.owner, entry.units);
+      // Both singles and combos arrive here holding a gathered reservation;
+      // the same commit turns provisional promises into the occupation.
+      const handle = commitCombo(entry);
       entry.owner.granted += 1;
       entry.resolve(handle);
       return;
     }
     // Expiry, cancellation and refusal give back any hold; none of those
     // outcomes itself counts as a reservation rollback.
-    if (entry.combo) releaseHolds(entry);
+    releaseHolds(entry);
     if (outcome === 'refused') {
       entry.owner.refused += 1;
       entry.reject(new QuotaExceededError('QUOTA_EXCEEDED', 'quota exceeded'));
@@ -555,9 +528,18 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
       if (wave >= stopWave) break;
       let served = false;
       if (!entry.combo) {
-        if (r.poolUsed + entry.units > r.poolLimit) break;
-        settleEntry(entry, 'granted');
-        served = true;
+        // The pool flip (or a member/ancestor flip) may have reclaimed part
+        // of the held reservation; release what survived and gather anew.
+        if (entry.holdsHeld) releaseHolds(entry);
+        if (tryGatherOne(entry, entry.owner, entry.units)) {
+          settleEntry(entry, 'granted');
+          served = true;
+        } else {
+          // A single request cannot overtake and is not overtaken: it is an
+          // ordinary hard barrier against later arrivals, exactly like the
+          // baseline. No rollback counter moves for a single-gate attempt.
+          break;
+        }
       } else {
         // Combo's turn against the fresh pool: the pool flip reclaimed its
         // pool side; release the surviving own-side holds and gather anew.
@@ -736,7 +718,10 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
         // because member slices above a member's limit are simply borrowed.
         oversized = poolShrink ? entry.totalUnits > newLimit : false;
       } else {
-        oversized = entry.owner === state && entry.units > newLimit;
+        // A single-gate request above its own gate limit borrows the excess
+        // up the chain, so only shrinking the family pool itself can make it
+        // impossible to ever satisfy.
+        oversized = poolShrink && entry.units > newLimit;
       }
       if (oversized) {
         settleEntry(entry, 'refused');
@@ -996,14 +981,22 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
 
     if (oldRootState !== newRootState) {
       // Read-only classification first: split combos cannot reserve across
-      // families; wholly moved combos gather anew in the joined family.
+      // families; wholly moved combos and moved single requests gather anew
+      // in the joined family.
       const whollyMoved = [];
+      const movedSingles = [];
       const stayingCombos = [];
       const straddlers = [];
       const oldQ = oldRootState.queue;
       for (let i = oldRootState.head; i < oldQ.length; i += 1) {
         const entry = oldQ[i];
-        if (entry.removed || !entry.combo) continue;
+        if (entry.removed) continue;
+        if (!entry.combo) {
+          // A moved single's lend chain pointed into the old family; its hold
+          // is released below and re-gathered after the join.
+          if (moved.has(entry.owner)) movedSingles.push(entry);
+          continue;
+        }
         let inMoved = 0;
         for (const g of entry.comboGates) if (moved.has(g)) inMoved += 1;
         if (inMoved > 0 && inMoved < entry.comboGates.length) straddlers.push(entry);
@@ -1026,6 +1019,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
       // happens while the entries and gates still reference the old root.
       for (const entry of straddlers) settleEntry(entry, 'refused');
       for (const entry of whollyMoved) releaseHolds(entry);
+      for (const entry of movedSingles) releaseHolds(entry);
       for (const entry of stayingCombos) releaseMovedHolds(entry, moved, oldRootState);
 
       // Settle the admitted borrow in the old pool, re-borrow from the new one.
@@ -1126,10 +1120,13 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   }
 
   function acquire(units = 1, signal) {
-    assertInteger(units, 'units');
+    if (typeof units !== 'number') throw new TypeError('units must be a number');
     assertSignal(signal);
-    if (units < 1 || units > state.limit) {
-      throw new RangeError(`units must be between 1 and ${state.limit}`);
+    // Over-limit is NOT a parameter error: the occupation borrows whatever
+    // the gate's own quota cannot cover. Only non-positive or non-integer
+    // counts are rejected here.
+    if (!Number.isInteger(units) || units < 1) {
+      throw new RangeError('units must be a positive integer');
     }
     // A signal that fired before the call settles as CANCELLED without ever
     // entering the queue or touching quota.
@@ -1139,30 +1136,45 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
         new QuotaExceededError('CANCELLED', 'acquire was cancelled before it could queue'),
       );
     }
-    // A non-empty queue means earlier arrivals are still owed quota; new
-    // requests must not overtake them even if they would fit.
     const r = state.root;
-    if (r.liveQueued === 0 && r.poolUsed + units <= r.poolLimit) {
+
+    // Reserve up front, exactly like a one-member combination: the gate's own
+    // remaining quota, then lends up the direct parent chain, then the pool.
+    // With no earlier arrival the whole reservation commits in the same cut;
+    // otherwise the hold waits for this request's turn and the pool flip
+    // reclaims it before allocation.
+    const holder = makeEntry({
+      owner: state,
+      combo: false,
+      units,
+      resolve: () => {},
+      reject: () => {},
+      signal: null,
+      waitCharges: [],
+    });
+    const gathered = tryGatherOne(holder, state, units);
+
+    if (gathered && r.liveQueued === 0) {
       state.granted += 1;
-      return Promise.resolve(commitSingle(state, units));
+      return Promise.resolve(commitCombo(holder));
     }
     if (state.maxWaitMs === 0) {
+      // Zero wait refuses on the spot. A gathered request still cannot
+      // overtake earlier arrivals; give its hold back first.
+      if (gathered) releaseHolds(holder);
       state.refused += 1;
       return Promise.reject(new QuotaExceededError('QUOTA_EXCEEDED', 'quota exceeded'));
     }
+
     state.waiting += units;
     r.liveQueued += 1;
     return new Promise((resolve, reject) => {
-      const entry = makeEntry({
-        owner: state,
-        combo: false,
-        units,
-        resolve,
-        reject,
-        signal,
-        waitCharges: [{ gate: state, units }],
-      });
-      enqueueEntry(r, entry);
+      holder.resolve = resolve;
+      holder.reject = reject;
+      holder.signal = signal !== undefined && signal !== null ? signal : null;
+      holder.onAbort = () => onEntryAbort(holder);
+      holder.waitCharges = [{ gate: state, units }];
+      enqueueEntry(r, holder);
     });
   }
 

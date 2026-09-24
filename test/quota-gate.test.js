@@ -48,7 +48,7 @@ test('grants up to the limit and refuses beyond it', async () => {
   assert.equal(gate.stats().inFlight, 0);
 });
 
-test('validates constructor and acquire arguments', () => {
+test('validates constructor and acquire arguments', async () => {
   assert.throws(() => createGate(), TypeError);
   assert.throws(() => createGate({ limit: 1.5, windowMs: 10 }), TypeError);
   assert.throws(() => createGate({ limit: '2', windowMs: 10 }), TypeError);
@@ -58,18 +58,21 @@ test('validates constructor and acquire arguments', () => {
   assert.throws(() => createGate({ limit: 1, windowMs: 10, maxWaitMs: 1.5 }), TypeError);
 
   const gate = createGate({ limit: 3, windowMs: 1000 });
-  for (const units of [0, 4]) {
-    assert.throws(
-      () => gate.acquire(units),
-      (err) => {
-        assert.ok(err instanceof RangeError);
-        assert.match(err.message, /3/); // echoes the actual limit
-        return true;
-      },
-    );
-  }
-  assert.throws(() => gate.acquire(1.5), TypeError);
+  // Only non-positive or non-integer counts are parameter errors; an
+  // over-limit count borrows up the family chain instead of throwing.
+  assert.throws(() => gate.acquire(0), RangeError);
+  assert.throws(() => gate.acquire(-1), RangeError);
+  assert.throws(() => gate.acquire(1.5), RangeError);
   assert.throws(() => gate.acquire('1'), TypeError);
+  assert.throws(() => gate.acquire({}), TypeError);
+  // 4 exceeds the gate's own limit and the family pool (3): a quota refusal,
+  // not a RangeError.
+  await assert.rejects(gate.acquire(4), (err) => {
+    assert.ok(err instanceof QuotaExceededError);
+    assert.equal(err.code, 'QUOTA_EXCEEDED');
+    return true;
+  });
+  assert.equal(gate.stats().refused, 1);
 });
 
 test('release is idempotent and stale handles do not corrupt stats', async () => {
@@ -175,21 +178,28 @@ test('clock rollback does not revive expired windows or corrupt waits', async (t
   assert.equal(gate.stats().inFlight, 0);
 });
 
-test('child gates validate their parent and limit', () => {
+test('child gates validate their parent and limit', async () => {
   const parent = createGate({ limit: 3, windowMs: 1000 });
   assert.throws(() => createGate({ limit: 2, windowMs: 1000, parent: {} }), TypeError);
   assert.throws(() => createGate({ limit: 2, windowMs: 1000, parent: 'gate' }), TypeError);
   assert.throws(() => createGate({ limit: 4, windowMs: 1000, parent }), RangeError);
 
   const child = createGate({ limit: 2, windowMs: 1000, parent });
-  assert.throws(
-    () => child.acquire(3),
-    (err) => {
-      assert.ok(err instanceof RangeError);
-      assert.match(err.message, /2/); // echoes the child's own limit
-      return true;
-    },
-  );
+  // An over-limit count is not a parameter error: the child borrows the
+  // excess from the parent chain and the occupation commits as one. Here the
+  // parent is the root, so the excess comes out of the shared pool.
+  const over = await child.acquire(3);
+  assert.equal(child.stats().inFlight, 3);
+  over.release();
+
+  // With an intermediate parent the lend lands on that parent's own window.
+  const root = createGate({ limit: 5, windowMs: 1000 });
+  const mid = createGate({ limit: 3, windowMs: 1000, parent: root });
+  const leaf = createGate({ limit: 2, windowMs: 1000, parent: mid });
+  const over2 = await leaf.acquire(3); // own 2 plus one lent by mid
+  assert.equal(leaf.stats().inFlight, 3);
+  assert.equal(mid.stats().inFlight, 1); // the single lent unit
+  over2.release();
 });
 
 test('child and parent share one quota pool', async () => {
@@ -305,6 +315,142 @@ test('limit of one serializes the whole hierarchy', async () => {
   });
 });
 
+// --- Over-limit single-gate occupations: own quota first, then the chain ----
+
+test('an over-limit acquire borrows up the direct parent chain then the pool', async () => {
+  const root = createGate({ limit: 10, windowMs: 1000 });
+  const p = createGate({ limit: 3, windowMs: 1000, parent: root });
+  const a = createGate({ limit: 2, windowMs: 1000, parent: p });
+  await p.acquire(2); // two of p's own window used, one left to lend
+  const handle = await a.acquire(5); // own 2 + parent lend 1 + pool 2
+  assert.equal(a.stats().inFlight, 5);
+  assert.equal(p.stats().inFlight, 3); // its own 2 plus the lent unit
+  assert.equal(a.stats().granted, 1);
+  assert.equal(a.stats().refused, 0);
+  handle.release();
+  assert.equal(a.stats().inFlight, 0);
+  assert.equal(p.stats().inFlight, 2); // only p's own occupation remains
+});
+
+test('an over-limit request that the pool cannot cover is refused, not a RangeError', async () => {
+  const root = createGate({ limit: 3, windowMs: 1000 });
+  const a = createGate({ limit: 2, windowMs: 1000, parent: root });
+  await a.acquire(2);
+  await assert.rejects(a.acquire(2), (err) => {
+    assert.ok(err instanceof QuotaExceededError);
+    assert.equal(err.code, 'QUOTA_EXCEEDED');
+    return true;
+  });
+  assert.equal(a.stats().refused, 1);
+  // Even a wildly over-limit count is a quota refusal: the gate limit never
+  // raises RangeError.
+  await assert.rejects(a.acquire(99), (err) => err.code === 'QUOTA_EXCEEDED');
+});
+
+test('a patient over-limit acquire is granted one occupation at the pool flip', async () => {
+  const root = createGate({ limit: 3, windowMs: 60, maxWaitMs: 1000 });
+  const a = createGate({ limit: 2, windowMs: 10000, maxWaitMs: 1000, parent: root });
+  await root.acquire(3); // pool full
+  const h = await a.acquire(3); // own 2 plus one pool borrow, granted at the flip
+  assert.equal(a.stats().inFlight, 3);
+  assert.equal(a.stats().granted, 1);
+  h.release();
+});
+
+test('a queued single holds its reservation until it commits at the pool flip', async () => {
+  const root = createGate({ limit: 5, windowMs: 60, maxWaitMs: 1000 });
+  const a = createGate({ limit: 2, windowMs: 10000, maxWaitMs: 1000, parent: root });
+  await root.acquire(4); // pool 4/5
+  const pSingle = root.acquire(2); // earlier arrival; 4+2>5, queues
+  const pMine = a.acquire(1); // 4+1=5 gathers its own unit, waits behind
+  assert.equal(a.stats().waiting, 1);
+  assert.equal(a.stats().reserved, 1);
+  assert.equal(a.stats().inFlight, 0);
+  const [hSingle, hMine] = await Promise.all([pSingle, pMine]);
+  assert.equal(a.stats().reserved, 0); // reservation merges into the occupation
+  assert.equal(a.stats().inFlight, 1);
+  assert.equal(a.stats().waiting, 0);
+  hSingle.release();
+  hMine.release();
+});
+
+test('an over-limit head request is a hard barrier and is never overtaken', async () => {
+  const root = createGate({ limit: 4, windowMs: 40, maxWaitMs: 5000 });
+  const a = createGate({ limit: 4, windowMs: 10000, maxWaitMs: 5000, parent: root });
+  const ac = new AbortController();
+  const bigErr = a.acquire(5, ac.signal).then(() => null, (e) => e); // never fits pool 4
+  let smallSettled = false;
+  const pSmall = root.acquire(1).then((h) => { smallSettled = true; return h; });
+  await sleep(120); // several flips: a single-gate head never yields
+  assert.equal(smallSettled, false);
+  ac.abort(); // tear down the blocked head
+  assert.equal((await bigErr).code, 'CANCELLED');
+  const hSmall = await pSmall; // the later request flows only once the head leaves
+  assert.equal(smallSettled, true);
+  hSmall.release();
+});
+
+test('a parent window flip reclaims an over-limit occupation\'s chain lend, handle intact', async () => {
+  const root = createGate({ limit: 10, windowMs: 1000 });
+  const p = createGate({ limit: 2, windowMs: 40, parent: root });
+  const a = createGate({ limit: 2, windowMs: 10000, parent: p });
+  const h = await a.acquire(4); // own 2, parent lends 2
+  assert.equal(a.stats().inFlight, 4);
+  assert.equal(p.stats().inFlight, 2);
+  await sleep(80); // the parent window flips twice: the lend is reclaimed
+  assert.equal(p.stats().inFlight, 0);
+  assert.equal(a.stats().inFlight, 2); // the own part survives
+  h.release(); // still a valid handle; no double subtract
+  assert.equal(a.stats().inFlight, 0);
+});
+
+test('a parent window flip reclaims a queued single\'s uncommitted lend first', async () => {
+  const root = createGate({ limit: 10, windowMs: 200, maxWaitMs: 5000 });
+  const p = createGate({ limit: 2, windowMs: 40, maxWaitMs: 5000, parent: root });
+  const a = createGate({ limit: 2, windowMs: 10000, maxWaitMs: 5000, parent: p });
+  await root.acquire(4); // pool 4/10
+  const pBlocker = root.acquire(7); // earlier arrival; 4+7>10, queues
+  // own 2 + parent lend 2 + pool 1 = 5; 4+5<=10, so the hold gathers whole
+  // and waits behind the blocker.
+  const pMine = a.acquire(5);
+  assert.equal(a.stats().reserved, 2);
+  assert.equal(p.stats().reserved, 2);
+  await sleep(60); // p's window flips: the uncommitted lend is reclaimed
+  assert.equal(p.stats().reserved, 0);
+  assert.equal(a.stats().reserved, 2); // the member's own reservation survives
+  assert.equal(a.stats().waiting, 5);
+  const hBlocker = await pBlocker; // granted at the pool flip, then released
+  hBlocker.release();
+  const hMine = await pMine; // re-gathers in the live chain and grants
+  assert.equal(a.stats().inFlight, 5);
+  assert.equal(p.stats().inFlight, 2); // lent again on commit
+  hMine.release();
+});
+
+test('expiry and cancellation of an over-limit queued single release the whole hold', async () => {
+  const root = createGate({ limit: 5, windowMs: 10000, maxWaitMs: 5000 });
+  const a = createGate({ limit: 2, windowMs: 10000, maxWaitMs: 30, parent: root });
+  await root.acquire(3);
+  // 3+3>5, so it cannot gather; it expires without leaving anything behind.
+  await assert.rejects(a.acquire(3), (err) => err.code === 'WAIT_EXPIRED');
+  assert.equal(a.stats().expired, 1);
+  assert.equal(a.stats().waiting, 0);
+  assert.equal(a.stats().reserved, 0);
+  assert.equal(root.stats().reserved, 0);
+
+  await root.acquire(1); // pool 4/5
+  const pBlocker = root.acquire(2); // earlier arrival; 4+2>5, queues first
+  const ac = new AbortController();
+  const p = a.acquire(1, ac.signal); // own unit fits (4+1=5) and is held
+  assert.equal(a.stats().reserved, 1);
+  ac.abort();
+  await assert.rejects(p, (err) => err.code === 'CANCELLED');
+  assert.equal(a.stats().cancelled, 1);
+  assert.equal(a.stats().reserved, 0);
+  assert.equal(root.stats().reserved, 0);
+  pBlocker.catch(() => {});
+});
+
 // --- Runtime adjustments ---------------------------------------------------
 
 test('updateLimit validates value and hierarchy without producing a cut', () => {
@@ -362,38 +508,64 @@ test('updateLimit grow never grants queued requests early', async () => {
   h.release();
 });
 
-test('updateLimit on a child refuses only that child\'s oversized waiters', async () => {
-  const parent = createGate({ limit: 5, windowMs: 60, maxWaitMs: 1000 });
-  const child = createGate({ limit: 3, windowMs: 60, maxWaitMs: 1000, parent });
-  await parent.acquire(5); // pool full
+test('a child limit shrink does not refuse a single waiter the pool can still cover', async () => {
+  const root = createGate({ limit: 5, windowMs: 60, maxWaitMs: 1000 });
+  const child = createGate({ limit: 3, windowMs: 10000, maxWaitMs: 1000, parent: root });
+  await root.acquire(5); // pool full
   const pChild = child.acquire(3); // queued, 3 units
-  const pParent = parent.acquire(1); // queued behind
-  child.updateLimit(2); // the child's 3-unit request can never fit now
-  assert.equal(child.stats().refused, 1);
-  assert.equal(child.stats().waiting, 0);
-  assert.equal(parent.stats().waiting, 1); // the parent's waiter is untouched
-  await assert.rejects(pChild, (err) => {
+  const pRoot = root.acquire(1); // queued behind
+  child.updateLimit(2); // the request now exceeds the child's own limit
+  // The child cap no longer refuses it: the family pool covers 3, so the
+  // excess is borrowed up the chain; the root's waiter stays untouched.
+  assert.equal(child.stats().refused, 0);
+  assert.equal(child.stats().waiting, 3);
+  assert.equal(root.stats().waiting, 1);
+  const hChild = await pChild; // granted at the flip: own 2 plus one borrowed
+  assert.equal(child.stats().inFlight, 3);
+  hChild.release();
+  const hRoot = await pRoot;
+  hRoot.release();
+});
+
+test('a pool shrink refuses an over-limit single waiter that can never fit', async () => {
+  const root = createGate({ limit: 5, windowMs: 10000, maxWaitMs: 5000 });
+  const child = createGate({ limit: 2, windowMs: 10000, maxWaitMs: 5000, parent: root });
+  await root.acquire(5); // pool full
+  const p = child.acquire(4); // above the child limit; the pool could still cover it
+  assert.equal(child.stats().waiting, 4);
+  root.updateLimit(3); // now 4 can never fit anywhere in the family
+  await assert.rejects(p, (err) => {
     assert.equal(err.code, 'QUOTA_EXCEEDED');
     return true;
   });
-  const h = await pParent; // served at the pool window flip
-  h.release();
+  assert.equal(child.stats().refused, 1);
+  assert.equal(child.stats().waiting, 0);
+  assert.equal(child.stats().reserved, 0);
 });
 
-test('acquire validates units against the current limit', async () => {
+test('acquire validates the shape of units but never caps it at the gate limit', async () => {
   const gate = createGate({ limit: 2, windowMs: 1000 });
   gate.updateLimit(3);
   await gate.acquire(3); // allowed under the new limit
-  assert.throws(() => gate.acquire(4), RangeError);
+  // 4 exceeds the gate limit but is not a parameter error: it is refused as
+  // quota because the family pool (3) cannot cover it.
+  await assert.rejects(gate.acquire(4), (err) => err.code === 'QUOTA_EXCEEDED');
   gate.updateLimit(1);
   assert.throws(
-    () => gate.acquire(2),
+    () => gate.acquire(0),
     (err) => {
       assert.ok(err instanceof RangeError);
-      assert.match(err.message, /1/); // echoes the current limit
       return true;
     },
   );
+  assert.throws(() => gate.acquire(2.5), RangeError);
+  assert.throws(() => gate.acquire('2'), TypeError);
+  // A child can borrow beyond a shrunken own limit as long as the pool covers.
+  const parent = createGate({ limit: 5, windowMs: 1000 });
+  const child = createGate({ limit: 1, windowMs: 1000, parent });
+  const h = await child.acquire(3); // own 1, two borrowed up the chain
+  assert.equal(child.stats().inFlight, 3);
+  h.release();
 });
 
 test('updateWindowMs restarts the current window with the new length', async () => {
@@ -553,6 +725,24 @@ test('reparent migrates queued waiters into the new family queue', async () => {
   assert.equal(child.stats().waiting, 1); // still queued, not granted early
   const h = await p; // served at the NEW family's window flip
   assert.equal(child.stats().granted, 1);
+  h.release();
+});
+
+test('reparent re-gathers a migrated over-limit waiter against the new chain', async () => {
+  const oldRoot = createGate({ limit: 2, windowMs: 10000, maxWaitMs: 5000 });
+  const oldMid = createGate({ limit: 2, windowMs: 10000, maxWaitMs: 5000, parent: oldRoot });
+  const leaf = createGate({ limit: 1, windowMs: 10000, maxWaitMs: 5000, parent: oldMid });
+  const newRoot = createGate({ limit: 4, windowMs: 60, maxWaitMs: 5000 });
+  const newMid = createGate({ limit: 3, windowMs: 10000, maxWaitMs: 5000, parent: newRoot });
+  await oldRoot.acquire(2); // old pool full: the over-limit request queues
+  const p = leaf.acquire(3); // own 1, the rest would have to be lent/borrowed
+  assert.equal(leaf.stats().waiting, 3);
+  leaf.reparent(newMid); // joins the new family; the old-family hold is dropped
+  assert.equal(oldRoot.stats().reserved, 0); // nothing leaks in the old family
+  assert.equal(leaf.stats().waiting, 3); // still queued, not granted early
+  const h = await p; // re-gathers in the new chain and grants at the pool flip
+  assert.equal(leaf.stats().inFlight, 3);
+  assert.equal(newMid.stats().inFlight, 2); // own 1 plus two lent units
   h.release();
 });
 

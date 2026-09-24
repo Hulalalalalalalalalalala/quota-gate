@@ -68,14 +68,24 @@ borrowed by admitted occupations; admitted handles stay valid throughout.
 
 Passing `parent` (a gate created by this module) makes a child gate that
 shares the parent's quota pool: every grant in the hierarchy draws from the
-root pool, and a child's `limit` must not exceed its parent's. When a child's
-own remaining quota cannot cover a request, the child borrows the shortfall
-from the parent pool to complete that one occupation. Borrowed quota is
-forcibly reclaimed when the parent's window ends; the reclaim never breaks
-admitted occupations (handles stay valid) and the corresponding `inFlight`
-drop is visible in the same stats snapshot. Queued requests across the whole
-hierarchy wait in one arrival-ordered queue and are served all-or-nothing
-before any later arrival, so no request is postponed indefinitely.
+root pool, and a child's `limit` must not exceed its parent's. A request
+first spends the gate's own remaining current-window quota; any shortfall
+borrows the direct parent's own quota, then the grandparent's, and so on up
+the chain, registering every lend as a reservation, with the root pool
+covering whatever remains. A gate's own limit therefore never caps a
+request: an over-limit count is not a parameter error (only non-positive or
+non-integer counts raise `RangeError`, and wrong types raise `TypeError`).
+If the family pool cannot cover the whole occupation in one go, the request
+is refused `QUOTA_EXCEEDED` on the spot with `maxWaitMs` 0, and otherwise
+queues in arrival order, holding the parts it could reserve. Borrowed quota
+is forcibly reclaimed when the lender's window ends — uncommitted
+reservations first, then the parts borrowed by admitted occupations; the
+reclaim never breaks admitted occupations (handles stay valid) and the
+corresponding `inFlight` drop is visible in the same stats snapshot. Queued
+requests across the whole hierarchy wait in one arrival-ordered queue; a
+single-gate request that cannot yet be covered is an ordinary barrier,
+while a blocked combination yields to later requests that fit (twice, then
+it too becomes a barrier), so no request is postponed indefinitely.
 
 ## Runtime adjustment
 
@@ -88,7 +98,10 @@ grants queued requests early and never tears apart admitted occupations.
   a direct child's limit (`RangeError` otherwise; non-integers raise
   `TypeError`). After a shrink, queued requests that can never fit are
   refused immediately with `QUOTA_EXCEEDED` and leave the queue, so they
-  never block later arrivals.
+  never block later arrivals. Only the family pool cap can make a request
+  unfit: a single-gate request (or a combination member) above its own
+  gate's shrunken limit simply borrows the excess up the chain rather than
+  being refused.
 - `updateWindowMs(windowMs)` changes the window length. The current window
   keeps running with a fresh, full length measured from the adjustment; used
   quota is not cleared and queued deadlines do not move.
