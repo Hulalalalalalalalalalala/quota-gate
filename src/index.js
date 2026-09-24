@@ -61,10 +61,27 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     isRoot: parentState === null,
     // Own-window accounting.
     ownGen: 0, // bumped on every own-window flip, invalidates old handles
-    usedOwn: 0, // own units granted in this gate's current own window
+    usedOwn: 0, // own units occupied or lent out in the current own window
     inFlight: 0, // units occupied through this gate and not yet cleared
-    borrowedInFlight: 0, // borrowed units still occupied; reclaimed at root flip
-    poolDraw: 0, // units charged into the current window of the root pool
+    borrowedInFlight: 0, // units this gate's occupations borrowed, still live
+    lentInFlight: 0, // own units lent to descendants' admitted occupations
+    poolDraw: 0, // committed pool charge, valid only when drawGen === poolGen
+    drawGen: -1,
+    // Cross-gate reservation accounting. A pending acquireAll first reserves
+    // the member's own current-window slice, then own slices up the direct
+    // parent chain (each step registering the lend); the root pool covers the
+    // remainder. Every gathered unit draws pool room until commit or rollback.
+    //
+    // A non-root gate's reserved units are pendingOwn + pendingLends: own
+    // window units promised to pending combos, as member or as ancestor
+    // lender. The root's reserved units are poolResvUnits: uncommitted units
+    // drawn from the pool. Across the family every reserved unit counts once.
+    rolledBack: 0, // failed whole-combo reservation attempts owned here
+    pendingOwn: 0,
+    pendingLends: 0,
+    resvAsMember: new Set(), // entries holding pendingOwn here
+    resvAsLender: new Set(), // entries holding pendingLends here
+    lentLinks: new Set(), // admitted occupation links lent from this gate
     // Observability.
     waiting: 0, // units currently queued through this gate
     granted: 0,
@@ -83,10 +100,14 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     Object.assign(state, {
       poolLimit: limit,
       poolGen: 0, // bumped on every root-window flip
-      poolUsed: 0, // units granted through every gate in the current pool window
+      poolUsed: 0, // units committed or reserved in the current pool window
+      poolLinks: new Set(), // admitted pool borrows, reclaimed at the pool flip
+      poolResv: new Set(), // uncommitted pool reservation links
+      poolResvUnits: 0, // sum of units behind poolResv
       queue: [], // queued requests from every gate, in arrival order
       head: 0, // index of the first live entry; entries are never shifted
       liveQueued: 0, // entries not yet settled
+      serveWave: 0, // monotonic count of serves that overtook a blocked combo
       minDeadline: Infinity, // earliest live deadline, skips idle sweeps
       lastNow: 0, // monotonic clock: never moves backwards
       members: new Set(),
@@ -109,57 +130,320 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     return r.lastNow;
   }
 
-  // A request fits when the shared pool has room. A child covers whatever its
-  // own remaining quota cannot by borrowing from the pool, so its own limit
-  // never blocks a grant; only the pool does.
-  function fits(units) {
-    const r = state.root;
-    return units <= r.poolLimit - r.poolUsed;
+  function effectiveDraw(node) {
+    return node.drawGen === node.root.poolGen ? node.poolDraw : 0;
   }
 
-  function applyGrant(target, units) {
-    const targetRoot = target.root;
-    targetRoot.poolUsed += units;
-    target.poolDraw += units;
-    if (target === targetRoot) {
-      target.usedOwn += units;
-      target.inFlight += units;
-      return { ownPart: units, borrowPart: 0 };
+  function chargeDraw(node, units) {
+    if (node.drawGen !== node.root.poolGen) {
+      node.drawGen = node.root.poolGen;
+      node.poolDraw = 0;
     }
-    const ownPart = Math.min(units, Math.max(0, target.limit - target.usedOwn));
-    const borrowPart = units - ownPart;
-    target.usedOwn += ownPart;
-    target.inFlight += units;
-    target.borrowedInFlight += borrowPart;
-    return { ownPart, borrowPart };
+    node.poolDraw += units;
   }
 
-  function makeHandle(target, ownPart, borrowPart, ownGen, poolRoot, poolGen) {
-    const handle = {
-      _active: true,
-      _target: target,
-      _ownPart: ownPart,
-      _borrowPart: borrowPart,
-      _ownGen: ownGen,
-      _poolRoot: poolRoot,
-      _poolGen: poolGen,
-      release() {
-        if (!this._active) return;
-        this._active = false;
-        this._target.openHandles.delete(this);
-        if (this._ownGen !== this._target.ownGen) return; // window closed; cleared
-        this._target.inFlight -= this._ownPart;
-        if (this._borrowPart > 0 && this._poolGen === this._poolRoot.poolGen) {
-          this._target.inFlight -= this._borrowPart;
-          this._target.borrowedInFlight -= this._borrowPart;
+  function reservedOn(g) {
+    return g === g.root ? g.root.poolResvUnits : g.pendingOwn + g.pendingLends;
+  }
+
+  // --- Combo reservations ---------------------------------------------------
+  //
+  // seg:  { gate, units, own, ownReleased, links, gen }
+  // link: { kind:'own'|'pool', lender, units, released, gen }
+  //
+  // Gather plans first and applies second, so a plan the pool cannot cover is
+  // rejected without any mutation and the whole-combo rollback is trivial.
+  // Sibling members share ancestor chains; the tentative `claimed` map debits
+  // ancestor headroom cumulatively inside one plan. Every registration is
+  // intrusive: commit, rollback and window-flip reclaims touch only the gates
+  // involved, never the queue or the whole family.
+
+  function buildSegs(comboGates, unitsOf) {
+    return comboGates.map((g) => ({
+      gate: g,
+      units: unitsOf(g),
+      own: 0,
+      ownReleased: false, // member own slice already reclaimed by an own flip
+      links: [],
+      gen: -1,
+    }));
+  }
+
+  function ownHeadroom(g, claimed) {
+    return Math.max(0, g.limit - g.usedOwn - g.pendingOwn - g.pendingLends - (claimed.get(g) ?? 0));
+  }
+
+  // Pure plan: fills seg.own / seg.links and returns total pool need. A
+  // member slice larger than that gate's own limit simply borrows the excess
+  // up the chain — member limits never cap a combo, only the root pool does.
+  function planGather(segs) {
+    const r = state.root;
+    const claimed = new Map();
+    let poolNeed = 0;
+    for (const seg of segs) {
+      const m = seg.gate;
+      if (m === r) {
+        seg.links.push({ kind: 'pool', lender: r, units: seg.units, released: false, gen: -1 });
+        poolNeed += seg.units;
+        continue;
+      }
+      let need = seg.units;
+      const own = Math.min(need, ownHeadroom(m, claimed));
+      seg.own = own;
+      claimed.set(m, (claimed.get(m) ?? 0) + own);
+      need -= own;
+      let cur = m.parent;
+      while (need > 0 && cur !== null && cur !== r) {
+        const lend = Math.min(need, ownHeadroom(cur, claimed));
+        if (lend > 0) {
+          seg.links.push({ kind: 'own', lender: cur, units: lend, released: false, gen: -1 });
+          claimed.set(cur, (claimed.get(cur) ?? 0) + lend);
+          need -= lend;
         }
-        // A stale poolGen means the root window already reclaimed the
-        // borrowed part; the handle stays valid but must not subtract twice.
+        cur = cur.parent;
+      }
+      if (need > 0) {
+        seg.links.push({ kind: 'pool', lender: r, units: need, released: false, gen: -1 });
+        poolNeed += need;
+      }
+    }
+    return poolNeed;
+  }
+
+  // Apply a planned reservation; the caller pre-checked poolNeed against room.
+  function applyGather(entry, segs) {
+    const r = entry.owner.root;
+    const gen = r.poolGen;
+    for (const seg of segs) {
+      const m = seg.gate;
+      seg.gen = gen;
+      seg.ownReleased = false;
+      if (m !== r && seg.own > 0) {
+        m.pendingOwn += seg.own;
+        m.resvAsMember.add(entry);
+        r.poolUsed += seg.own;
+      }
+      for (const link of seg.links) {
+        link.gen = gen;
+        r.poolUsed += link.units;
+        if (link.kind === 'own') {
+          link.lender.pendingLends += link.units;
+          link.lender.resvAsLender.add(entry);
+        } else {
+          r.poolResv.add(link);
+          r.poolResvUnits += link.units;
+          if (m === r) m.resvAsMember.add(entry);
+        }
+      }
+    }
+    entry.segs = segs;
+    entry.holdsHeld = true;
+  }
+
+  // Plan, check pool room, apply — or reject without touching anything. The
+  // whole combo draws pool room: a member's own slice and every ancestor lend
+  // are partitions OF the pool, not capacity beyond it. Feasibility is
+  // therefore simply poolUsed + total combo units <= poolLimit; the plan's
+  // own/lender/pool partition only decides which own window each unit lands
+  // on (and thus where its flip reclaims it).
+  function tryGather(entry, segs) {
+    const r = entry.owner.root;
+    let total = 0;
+    for (const seg of segs) total += seg.units;
+    if (r.poolUsed + total > r.poolLimit) {
+      for (const seg of segs) {
+        seg.own = 0;
+        seg.links = [];
+      }
+      return false;
+    }
+    planGather(segs);
+    applyGather(entry, segs);
+    return true;
+  }
+
+  // Release a held reservation wholesale. Pool room is refunded only while
+  // the charged pool window is still the current one; a pool flip already
+  // reclaimed it (the link is marked released and its gen is stale).
+  function releaseHolds(entry) {
+    if (!entry.holdsHeld || entry.segs === null) return;
+    const r = entry.owner.root;
+    for (const seg of entry.segs) {
+      const m = seg.gate;
+      if (!seg.ownReleased && seg.own > 0) {
+        seg.ownReleased = true;
+        m.pendingOwn -= seg.own;
+        m.resvAsMember.delete(entry);
+        if (seg.gen === r.poolGen) r.poolUsed -= seg.own;
+      }
+      for (const link of seg.links) {
+        if (link.released) continue;
+        link.released = true;
+        if (link.kind === 'pool') {
+          // delete() reports whether the link still charged the pool: a pool
+          // flip already cleared the set and zeroed poolResvUnits, so a stale
+          // link must not subtract twice.
+          if (r.poolResv.delete(link)) r.poolResvUnits -= link.units;
+          m.resvAsMember.delete(entry);
+        } else {
+          link.lender.pendingLends -= link.units;
+          link.lender.resvAsLender.delete(entry);
+        }
+        if (link.gen === r.poolGen) r.poolUsed -= link.units;
+      }
+    }
+    entry.holdsHeld = false;
+    entry.segs = null;
+  }
+
+  // --- Handles --------------------------------------------------------------
+  //
+  // The handle exposes exactly one own property, release, as a closure: the
+  // destructured method called without a receiver works the same. Every link
+  // remembers the generations of both sides, so a release after either window
+  // flipped never subtracts quota that flip already settled.
+
+  function makeHandle(records) {
+    let active = true;
+    return {
+      release() {
+        if (!active) return;
+        active = false;
+        for (const rec of records) {
+          const seg = rec.seg;
+          const m = seg.member;
+          const r = m.root;
+          m.openHandles.delete(rec);
+          if (seg.mgen === m.ownGen && seg.own > 0) {
+            m.inFlight -= seg.own;
+          }
+          for (const link of seg.links) {
+            const memberLive = seg.mgen === m.ownGen;
+            const lenderLive =
+              link.kind === 'pool' ? link.lgen === r.poolGen : link.lgen === link.lender.ownGen;
+            if (!memberLive || !lenderLive) continue; // a window flip settled it
+            m.inFlight -= link.units;
+            m.borrowedInFlight -= link.units;
+            if (link.kind === 'pool') {
+              r.poolLinks.delete(link);
+            } else {
+              link.lender.lentLinks.delete(link);
+              link.lender.inFlight -= link.units;
+              link.lender.lentInFlight -= link.units;
+            }
+          }
+        }
       },
     };
-    target.openHandles.add(handle);
-    return handle;
   }
+
+  // Commit a single-gate occupation with the baseline partition: own quota
+  // first, every shortfall drawn straight from the root pool.
+  function commitSingle(target, units) {
+    const r = target.root;
+    r.poolUsed += units;
+    chargeDraw(target, units);
+    let seg;
+    if (target === r) {
+      target.usedOwn += units;
+      target.inFlight += units;
+      seg = { member: target, units, own: units, mgen: target.ownGen, links: [] };
+    } else {
+      const ownPart = Math.min(units, Math.max(0, target.limit - target.usedOwn));
+      const borrowPart = units - ownPart;
+      target.usedOwn += ownPart;
+      target.inFlight += units;
+      target.borrowedInFlight += borrowPart;
+      const links = [];
+      if (borrowPart > 0) {
+        const link = {
+          kind: 'pool',
+          lender: r,
+          member: target,
+          units: borrowPart,
+          lgen: r.poolGen,
+          mgen: target.ownGen,
+        };
+        r.poolLinks.add(link);
+        links.push(link);
+      }
+      seg = { member: target, units, own: ownPart, mgen: target.ownGen, links };
+    }
+    const rec = { seg };
+    target.openHandles.add(rec);
+    return makeHandle([rec]);
+  }
+
+  // Commit a fully gathered combo: provisional promises become admitted
+  // occupations. Pool room was charged at gather time, so poolUsed does not
+  // move here.
+  function commitCombo(entry) {
+    const r = entry.owner.root;
+    const records = [];
+    const lenderCleanup = new Set();
+    for (const seg0 of entry.segs) {
+      const m = seg0.gate;
+      const units = seg0.units;
+      chargeDraw(m, units);
+      let seg;
+      if (m === r) {
+        // The root member's whole slice is its own window and drew the pool
+        // directly; consume its pool reservation link so it does not survive
+        // the commit as uncommitted quota.
+        for (const l0 of seg0.links) {
+          if (l0.kind === 'pool' && r.poolResv.delete(l0)) r.poolResvUnits -= l0.units;
+        }
+        m.usedOwn += units;
+        m.inFlight += units;
+        m.resvAsMember.delete(entry);
+        seg = { member: m, units, own: units, mgen: m.ownGen, links: [] };
+      } else {
+        const ownPart = seg0.own;
+        m.usedOwn += ownPart;
+        m.pendingOwn -= ownPart;
+        m.resvAsMember.delete(entry);
+        m.inFlight += units;
+        const links = [];
+        for (const l0 of seg0.links) {
+          const link = {
+            kind: l0.kind,
+            lender: l0.lender,
+            member: m,
+            units: l0.units,
+            lgen: l0.kind === 'pool' ? r.poolGen : l0.lender.ownGen,
+            mgen: m.ownGen,
+          };
+          if (l0.kind === 'pool') {
+            if (r.poolResv.delete(l0)) r.poolResvUnits -= l0.units;
+            r.poolLinks.add(link);
+          } else {
+            const g = l0.lender;
+            g.usedOwn += l0.units;
+            g.pendingLends -= l0.units;
+            lenderCleanup.add(g);
+            g.inFlight += l0.units;
+            g.lentInFlight += l0.units;
+            link.pgen = r.poolGen; // pool window this lend charged
+            g.lentLinks.add(link);
+          }
+          links.push(link);
+        }
+        m.borrowedInFlight += units - ownPart;
+        seg = { member: m, units, own: ownPart, mgen: m.ownGen, links };
+      }
+      const rec = { seg };
+      m.openHandles.add(rec);
+      records.push(rec);
+    }
+    // One entry may borrow from the same ancestor for several sibling
+    // members; drop its lender registration once, after every link settled.
+    for (const g of lenderCleanup) g.resvAsLender.delete(entry);
+    entry.holdsHeld = false;
+    entry.segs = null;
+    return makeHandle(records);
+  }
+
+  // --- Queue entry lifecycle ------------------------------------------------
 
   function detachSignal(entry) {
     if (entry.signal !== null) {
@@ -177,22 +461,16 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     ownerRoot.liveQueued -= 1;
     clearTimeout(entry.timer);
     detachSignal(entry);
-    entry.owner.waiting -= entry.units;
+    for (const charge of entry.waitCharges) charge.gate.waiting -= charge.units;
     if (outcome === 'granted') {
-      const { ownPart, borrowPart } = applyGrant(entry.owner, entry.units);
+      const handle = entry.combo ? commitCombo(entry) : commitSingle(entry.owner, entry.units);
       entry.owner.granted += 1;
-      entry.resolve(
-        makeHandle(
-          entry.owner,
-          ownPart,
-          borrowPart,
-          entry.owner.ownGen,
-          entry.owner.root,
-          entry.owner.root.poolGen,
-        ),
-      );
+      entry.resolve(handle);
       return;
     }
+    // Expiry, cancellation and refusal give back any hold; none of those
+    // outcomes itself counts as a reservation rollback.
+    if (entry.combo) releaseHolds(entry);
     if (outcome === 'refused') {
       entry.owner.refused += 1;
       entry.reject(new QuotaExceededError('QUOTA_EXCEEDED', 'quota exceeded'));
@@ -257,65 +535,162 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     r.minDeadline = min;
   }
 
-  // Grant queued requests in arrival order, all-or-nothing; a request that
-  // does not fit blocks every later one. New arrivals are queued behind
-  // waiters instead of overtaking them, so the head is always served at the
-  // next root window flip and nothing is postponed indefinitely.
+  // Allocation walks arrivals in order against the freshly reset pool. A head
+  // combo that cannot be gathered whole does not starve later arrivals: a
+  // later request that fits outright passes it and the combo yields once;
+  // after yielding twice (cumulatively, across flips) it becomes a hard
+  // barrier like a non-fitting single. The pass is O(1) per live queue entry:
+  // a single monotonic counter (serveWave, bumped once per overtaking serve)
+  // lets each blocked combo derive its yield count without being touched by
+  // the requests that pass it.
   function allocate() {
     const r = state.root;
     const q = r.queue;
-    while (r.head < q.length) {
-      const entry = q[r.head];
-      if (entry.removed) {
-        r.head += 1;
-        continue;
+    let wave = r.serveWave; // overtakes counted so far, monotonic across passes
+    let stopWave = Infinity; // earliest wave at which a blocker hardens
+    let blockerCount = 0; // blocked combos registered earlier in this/prev passes
+    for (let i = r.head; i < q.length; i += 1) {
+      const entry = q[i];
+      if (entry.removed) continue;
+      if (wave >= stopWave) break;
+      let served = false;
+      if (!entry.combo) {
+        if (r.poolUsed + entry.units > r.poolLimit) break;
+        settleEntry(entry, 'granted');
+        served = true;
+      } else {
+        // Combo's turn against the fresh pool: the pool flip reclaimed its
+        // pool side; release the surviving own-side holds and gather anew.
+        if (entry.holdsHeld) releaseHolds(entry);
+        const segs = buildSegs(entry.comboGates, (g) => entry.comboUnits.get(g));
+        if (tryGather(entry, segs)) {
+          settleEntry(entry, 'granted');
+          served = true;
+        } else {
+          // Any step short: the plan touched nothing; count one whole
+          // rollback (no other counter moves) and register a soft barrier.
+          entry.owner.rolledBack += 1;
+          if (entry.blockG !== -1) entry.yields += wave - entry.blockG;
+          entry.blockG = wave;
+          const hardensAt = wave + (2 - entry.yields);
+          blockerCount += 1;
+          if (hardensAt < stopWave) stopWave = hardensAt;
+        }
       }
-      if (!fits(entry.units)) break;
-      r.head += 1;
-      settleEntry(entry, 'granted');
+      if (served && blockerCount > 0) wave += 1; // one yield per overtaken blocker
     }
+    r.serveWave = wave;
+    while (r.head < q.length && q[r.head].removed) r.head += 1;
     if (r.head > 32 && r.head * 2 >= q.length) {
       r.queue = q.slice(r.head);
       r.head = 0;
     }
   }
 
+  // --- Window flips ----------------------------------------------------------
+
+  // A non-root own window reclaims quota borrowed FROM this gate, uncommitted
+  // reservations first (member own slice, then ancestor lends), then admitted
+  // lends. Occupations admitted through this gate end with its window.
+  // Handles never break.
   function flipOwn(target) {
     now();
+    const r = target.root;
+
+    // 1a) Uncommitted member-own promises on the flipping gate.
+    for (const entry of target.resvAsMember) {
+      if (entry.removed || !entry.holdsHeld) continue;
+      for (const seg of entry.segs) {
+        if (seg.gate !== target || seg.ownReleased || seg.own === 0) continue;
+        seg.ownReleased = true;
+        target.pendingOwn -= seg.own;
+        if (seg.gen === r.poolGen) r.poolUsed -= seg.own;
+      }
+    }
+    target.resvAsMember.clear();
+
+    // 1b) Uncommitted lends promised FROM the flipping gate.
+    for (const entry of target.resvAsLender) {
+      if (entry.removed || !entry.holdsHeld) continue;
+      for (const seg of entry.segs) {
+        for (const link of seg.links) {
+          if (link.released || link.kind !== 'own' || link.lender !== target) continue;
+          link.released = true;
+          target.pendingLends -= link.units;
+          if (link.gen === r.poolGen) r.poolUsed -= link.units;
+        }
+      }
+    }
+    target.resvAsLender.clear();
+
+    // 2) Occupations admitted THROUGH the flipping gate end with its window.
+    //    The handles go inert; links survive for their own side's reclaim, and
+    //    the mgen guard below keeps that reclaim idempotent.
+    target.openHandles.clear();
+
+    // 3) Reclaim admitted lends FROM the flipping gate: borrowing members keep
+    //    valid handles; only their inFlight settles, in this same snapshot.
+    //    The pool room charged for those lent units at gather time frees here,
+    //    exactly like the baseline's parent-window borrow reclaim.
+    for (const link of target.lentLinks) {
+      if (link.mgen === link.member.ownGen) {
+        link.member.inFlight -= link.units;
+        link.member.borrowedInFlight -= link.units;
+      }
+      if (link.lgen === target.ownGen && target !== r && link.pgen === r.poolGen) {
+        r.poolUsed -= link.units;
+      }
+    }
+    target.lentLinks.clear();
+
     target.ownGen += 1;
     target.usedOwn = 0;
-    target.inFlight = 0; // occupations from the closed window clear automatically
+    target.inFlight = 0;
     target.borrowedInFlight = 0;
-    // Handles born in the closed window are inert now; drop them so handles
-    // their holders never release cannot accumulate.
-    for (const handle of target.openHandles) {
-      if (handle._ownGen !== target.ownGen) target.openHandles.delete(handle);
-    }
+    target.lentInFlight = 0;
+    target.pendingOwn = 0;
+    target.pendingLends = 0;
   }
 
   function flipRoot() {
     const t = now();
+    const r = state;
+
+    // Expiry is judged before anything is reclaimed or granted.
     sweepExpired(t);
-    state.ownGen += 1;
-    state.usedOwn = 0;
-    state.inFlight = 0;
-    state.borrowedInFlight = 0;
-    for (const handle of state.openHandles) {
-      if (handle._ownGen !== state.ownGen) state.openHandles.delete(handle);
-    }
-    // Reclaim borrowed quota from every family member. The reclaim does not
-    // break admitted occupations: handles stay valid, only the borrowed
-    // accounting settles, and the inFlight drop is visible in the same stats
-    // snapshot as the pool window flip.
-    state.poolGen += 1;
-    state.poolUsed = 0;
-    for (const member of state.members) {
-      member.poolDraw = 0;
-      if (member !== state) {
-        member.inFlight -= member.borrowedInFlight;
-        member.borrowedInFlight = 0;
+
+    // 1) Reclaim uncommitted reservation borrows from the pool FIRST, before
+    //    admitted occupations' pool borrows. The combos stay queued and gather
+    //    again at their turn below; non-root own slices survive their windows.
+    for (const link of r.poolResv) link.released = true;
+    r.poolResv.clear();
+    r.poolResvUnits = 0;
+    r.resvAsMember.clear();
+
+    // 2) Reclaim admitted pool borrows. Handles stay valid; the inFlight drop
+    //    is visible in this same snapshot.
+    for (const link of r.poolLinks) {
+      if (link.mgen === link.member.ownGen) {
+        link.member.inFlight -= link.units;
+        link.member.borrowedInFlight -= link.units;
       }
     }
+    r.poolLinks.clear();
+
+    // 3) The root's own occupations end with its own window.
+    r.openHandles.clear();
+    r.ownGen += 1;
+    r.usedOwn = 0;
+    r.inFlight = 0;
+    r.borrowedInFlight = 0;
+    r.lentInFlight = 0;
+
+    // The pool window resets. Committed poolDraw is generation-tagged, so no
+    // family-wide sweep is needed.
+    r.poolGen += 1;
+    r.poolUsed = 0;
+
+    // 4) Serve the queue in arrival order, re-gathering combos as they come.
     allocate();
   }
 
@@ -345,14 +720,25 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
 
   // Shrink fallout: queued requests that can never fit are refused
   // immediately and leave the queue, so they never block later arrivals.
-  // Occupations are never torn apart.
-  function refuseUnfittable(ownerFilter, newLimit) {
+  // Occupations are never torn apart; a combo that can no longer be satisfied
+  // is refused as a whole, releasing its reservation in the same cut.
+  function refuseUnfittable(newLimit) {
     const r = state.root;
     const q = r.queue;
     let touched = false;
+    const poolShrink = state === r;
     for (let i = r.head; i < q.length; i += 1) {
       const entry = q[i];
-      if (!entry.removed && entry.units > newLimit && ownerFilter(entry.owner)) {
+      if (entry.removed) continue;
+      let oversized;
+      if (entry.combo) {
+        // The whole combo must fit the pool; only the pool cap can refuse it,
+        // because member slices above a member's limit are simply borrowed.
+        oversized = poolShrink ? entry.totalUnits > newLimit : false;
+      } else {
+        oversized = entry.owner === state && entry.units > newLimit;
+      }
+      if (oversized) {
         settleEntry(entry, 'refused');
         touched = true;
       }
@@ -370,10 +756,8 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     state.limit = newLimit;
     if (state.isRoot) {
       state.root.poolLimit = newLimit;
-      refuseUnfittable(() => true, newLimit);
-    } else {
-      refuseUnfittable((owner) => owner === state, newLimit);
     }
+    refuseUnfittable(newLimit);
   }
 
   function updateWindowMs(newWindowMs) {
@@ -438,9 +822,87 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     return false;
   }
 
-  // Partition the old root queue at the moved subtree boundary, then merge
-  // the moved entries into the new root queue preserving global arrival
-  // order (entry.seq is assigned monotonically at enqueue time).
+  // Rebuild the borrow side of one admitted occupation segment after its
+  // member moved into a new family. The member's own slice and handle survive
+  // (a former root turned child keeps only its limit-sized own slice); every
+  // old link is detached, settling live sides, and the borrowed remainder is
+  // drawn from the new family's pool directly — the same flat partition a
+  // single-gate occupation always used. The bulk pool charge moved once with
+  // the subtree (subtreeDraw), so this function moves no poolUsed.
+  function reborrowSeg(seg, oldRootState, newRootState) {
+    const m = seg.member;
+    for (const link of seg.links) {
+      if (link.kind === 'pool') {
+        oldRootState.poolLinks.delete(link);
+      } else if (link.lgen === link.lender.ownGen) {
+        // The lend leaves the old family with the moving occupation: settle
+        // its lender side as well as the occupation side.
+        const g = link.lender;
+        g.lentLinks.delete(link);
+        g.usedOwn -= link.units;
+        g.inFlight -= link.units;
+        g.lentInFlight -= link.units;
+      }
+      if (link.mgen === m.ownGen) {
+        m.inFlight -= link.units;
+        m.borrowedInFlight -= link.units;
+      }
+    }
+    seg.links = [];
+
+    let ownPart = seg.own;
+    if (m === oldRootState) {
+      // A former root counted the whole occupation as its own; as a child only
+      // its limit-sized slice stays own, and inFlight must not change.
+      ownPart = Math.min(seg.units, m.limit);
+      m.usedOwn -= seg.units - ownPart;
+      seg.own = ownPart;
+    }
+    const need = seg.units - ownPart;
+    if (need > 0) {
+      const link = {
+        kind: 'pool',
+        lender: newRootState,
+        member: m,
+        units: need,
+        lgen: newRootState.poolGen,
+        mgen: m.ownGen,
+      };
+      newRootState.poolLinks.add(link);
+      seg.links.push(link);
+      m.borrowedInFlight += need;
+      if (m !== oldRootState) m.inFlight += need;
+    }
+  }
+
+  // Release provisional links of a staying queued combo whose lender (or whose
+  // member own quota) belongs to a subtree that is leaving the family.
+  function releaseMovedHolds(entry, moved, oldRootState) {
+    if (!entry.holdsHeld) return;
+    for (const seg of entry.segs) {
+      if (!seg.ownReleased && seg.own > 0 && moved.has(seg.gate)) {
+        seg.ownReleased = true;
+        seg.gate.pendingOwn -= seg.own;
+        seg.gate.resvAsMember.delete(entry);
+        if (seg.gen === oldRootState.poolGen) oldRootState.poolUsed -= seg.own;
+      }
+      for (const link of seg.links) {
+        if (link.released || !moved.has(link.lender)) continue;
+        link.released = true;
+        if (link.kind === 'pool') {
+          if (oldRootState.poolResv.delete(link)) oldRootState.poolResvUnits -= link.units;
+        } else {
+          link.lender.pendingLends -= link.units;
+          link.lender.resvAsLender.delete(entry);
+        }
+        if (link.gen === oldRootState.poolGen) oldRootState.poolUsed -= link.units;
+      }
+    }
+  }
+
+  // Partition the old/new queues at the moved-subtree boundary, preserving
+  // global arrival order. Entries were already settled or had their
+  // reservations released by the caller; removed entries are skipped.
   function migrateQueue(oldRootState, newRootState, moved) {
     const staying = [];
     const movedEntries = [];
@@ -449,7 +911,19 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     for (let i = oldRootState.head; i < oldQ.length; i += 1) {
       const entry = oldQ[i];
       if (entry.removed) continue;
-      if (moved.has(entry.owner)) {
+      let isMoved;
+      if (entry.combo) {
+        isMoved = entry.comboGates.every((g) => moved.has(g));
+      } else {
+        isMoved = moved.has(entry.owner);
+      }
+      if (isMoved) {
+        if (entry.combo) {
+          // The overtake count belongs to the old family's fairness clock;
+          // the combo starts yielding fresh in the joined family.
+          entry.yields = 0;
+          entry.blockG = -1;
+        }
         movedEntries.push(entry);
         movedLive += 1;
       } else {
@@ -474,7 +948,10 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     let a = 0;
     let b = 0;
     while (a < existing.length || b < movedEntries.length) {
-      if (b === movedEntries.length || (a < existing.length && existing[a].seq <= movedEntries[b].seq)) {
+      if (
+        b === movedEntries.length ||
+        (a < existing.length && existing[a].seq <= movedEntries[b].seq)
+      ) {
         merged.push(existing[a]);
         a += 1;
       } else {
@@ -516,14 +993,28 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     const oldRootState = state.root;
     const newRootState = newParentState.root;
     const moved = collectSubtree(state);
-    let subtreeDraw = 0;
-    for (const node of moved) subtreeDraw += node.poolDraw;
 
     if (oldRootState !== newRootState) {
-      // Settle the borrow in the old family's window, then re-borrow from the
-      // new family. Both sides of the trade are visible in the same
-      // synchronous snapshot. If the new pool cannot cover the draw, the
-      // whole reparent is rejected with nothing changed.
+      // Read-only classification first: split combos cannot reserve across
+      // families; wholly moved combos gather anew in the joined family.
+      const whollyMoved = [];
+      const stayingCombos = [];
+      const straddlers = [];
+      const oldQ = oldRootState.queue;
+      for (let i = oldRootState.head; i < oldQ.length; i += 1) {
+        const entry = oldQ[i];
+        if (entry.removed || !entry.combo) continue;
+        let inMoved = 0;
+        for (const g of entry.comboGates) if (moved.has(g)) inMoved += 1;
+        if (inMoved > 0 && inMoved < entry.comboGates.length) straddlers.push(entry);
+        else if (inMoved === entry.comboGates.length) whollyMoved.push(entry);
+        else stayingCombos.push(entry);
+      }
+
+      // Capacity is decided before anything settles, so a rejected move rolls
+      // back trivially with no cut at all.
+      let subtreeDraw = 0;
+      for (const node of moved) subtreeDraw += effectiveDraw(node);
       if (newRootState.poolUsed + subtreeDraw > newRootState.poolLimit) {
         throw new QuotaExceededError(
           'QUOTA_EXCEEDED',
@@ -531,6 +1022,13 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
         );
       }
 
+      // Uncommitted reservations cannot cross families. Every release below
+      // happens while the entries and gates still reference the old root.
+      for (const entry of straddlers) settleEntry(entry, 'refused');
+      for (const entry of whollyMoved) releaseHolds(entry);
+      for (const entry of stayingCombos) releaseMovedHolds(entry, moved, oldRootState);
+
+      // Settle the admitted borrow in the old pool, re-borrow from the new one.
       const oldDirectParent = state.parent;
       oldRootState.poolUsed -= subtreeDraw;
       newRootState.poolUsed += subtreeDraw;
@@ -538,11 +1036,26 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
         oldRootState.members.delete(node);
         newRootState.members.add(node);
         node.root = newRootState;
-        // Outstanding occupations keep their place in the new pool window:
-        // their handles go stale exactly when the NEW pool flips.
-        for (const handle of node.openHandles) {
-          handle._poolRoot = newRootState;
-          handle._poolGen = newRootState.poolGen;
+        node.drawGen = newRootState.poolGen; // the draw now counts in the new pool
+      }
+      // Re-link the tree FIRST, so borrow walks below traverse the NEW chain.
+      if (oldDirectParent !== null) oldDirectParent.children.delete(state);
+      newParentState.children.add(state);
+      state.parent = newParentState;
+      if (state === oldRootState) {
+        // The old root gate becomes an ordinary child: its next window fire
+        // is a plain own-window flip; the new root owns the shared pool.
+        state.isRoot = false;
+      }
+      // Outstanding occupations keep running with the very same handles;
+      // only their borrow links are rebuilt against the new ancestor chain.
+      const processedSegs = new Set();
+      for (const node of moved) {
+        for (const rec of node.openHandles) {
+          if (moved.has(rec.seg.member) && !processedSegs.has(rec.seg)) {
+            processedSegs.add(rec.seg);
+            reborrowSeg(rec.seg, oldRootState, newRootState);
+          }
         }
       }
       migrateQueue(oldRootState, newRootState, moved);
@@ -552,21 +1065,64 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
       if (oldRootState.lastNow > newRootState.lastNow) {
         newRootState.lastNow = oldRootState.lastNow;
       }
-      if (oldDirectParent !== null) oldDirectParent.children.delete(state);
-      newParentState.children.add(state);
-      state.parent = newParentState;
-      if (state === oldRootState) {
-        // The old root gate becomes an ordinary child: its next window fire
-        // is a plain own-window flip; the new root owns the shared pool.
-        state.isRoot = false;
-      }
     } else {
       // Same family: only the direct link moves; the shared pool is
-      // untouched, so the old direct parent sees no cut at all.
+      // untouched, so the old direct parent sees no cut at all. Outstanding
+      // reservations and lend links keep pointing at their original gates.
       state.parent.children.delete(state);
       newParentState.children.add(state);
       state.parent = newParentState;
     }
+  }
+
+  // --- Enqueueing ------------------------------------------------------------
+
+  function makeEntry({
+    owner,
+    combo,
+    units,
+    resolve,
+    reject,
+    signal,
+    waitCharges,
+    comboGates,
+    comboUnits,
+    totalUnits,
+  }) {
+    const t = now();
+    const entry = {
+      owner,
+      combo,
+      units,
+      resolve,
+      reject,
+      seq: (enqueueSeq += 1),
+      enqueuedAt: t,
+      deadline: t + owner.maxWaitMs,
+      timer: null,
+      removed: false,
+      signal: signal !== undefined && signal !== null ? signal : null,
+      onAbort: null,
+      waitCharges,
+      yields: 0, // total overtakes conceded while blocked
+      blockG: -1, // serveWave at which this combo last registered as blocked
+      holdsHeld: false,
+      segs: null,
+      comboGates: comboGates ?? null,
+      comboUnits: comboUnits ?? null,
+      totalUnits: totalUnits ?? units,
+    };
+    entry.onAbort = () => onEntryAbort(entry);
+    return entry;
+  }
+
+  function enqueueEntry(r, entry) {
+    if (entry.signal !== null) {
+      entry.signal.addEventListener('abort', entry.onAbort, { once: true });
+    }
+    armEntry(entry, entry.owner.maxWaitMs);
+    if (entry.deadline < r.minDeadline) r.minDeadline = entry.deadline;
+    r.queue.push(entry);
   }
 
   function acquire(units = 1, signal) {
@@ -586,12 +1142,9 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     // A non-empty queue means earlier arrivals are still owed quota; new
     // requests must not overtake them even if they would fit.
     const r = state.root;
-    if (r.liveQueued === 0 && fits(units)) {
-      const { ownPart, borrowPart } = applyGrant(state, units);
+    if (r.liveQueued === 0 && r.poolUsed + units <= r.poolLimit) {
       state.granted += 1;
-      return Promise.resolve(
-        makeHandle(state, ownPart, borrowPart, state.ownGen, r, r.poolGen),
-      );
+      return Promise.resolve(commitSingle(state, units));
     }
     if (state.maxWaitMs === 0) {
       state.refused += 1;
@@ -600,27 +1153,138 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     state.waiting += units;
     r.liveQueued += 1;
     return new Promise((resolve, reject) => {
-      const t = now();
-      const entry = {
+      const entry = makeEntry({
         owner: state,
+        combo: false,
         units,
         resolve,
         reject,
-        seq: (enqueueSeq += 1),
-        enqueuedAt: t,
-        deadline: t + state.maxWaitMs,
-        timer: null,
-        removed: false,
-        signal: signal !== undefined && signal !== null ? signal : null,
-        onAbort: null,
-      };
-      entry.onAbort = () => onEntryAbort(entry);
-      if (entry.signal !== null) {
-        entry.signal.addEventListener('abort', entry.onAbort, { once: true });
+        signal,
+        waitCharges: [{ gate: state, units }],
+      });
+      enqueueEntry(r, entry);
+    });
+  }
+
+  // Validate an acquireAll member list and translate public gates into
+  // internal member states. Nothing here mutates runtime state.
+  function validateMembers(members) {
+    if (!Array.isArray(members)) {
+      throw new TypeError('members must be an array of { gate, units }');
+    }
+    if (members.length === 0) {
+      throw new RangeError('members must contain at least one gate');
+    }
+    const r = state.root;
+    const seen = new Set();
+    const gates = [];
+    const unitMap = new Map();
+    let total = 0;
+    for (const member of members) {
+      if (member === null || typeof member !== 'object') {
+        throw new TypeError('each member must be { gate, units }');
       }
-      armEntry(entry, state.maxWaitMs);
-      if (entry.deadline < r.minDeadline) r.minDeadline = entry.deadline;
-      r.queue.push(entry);
+      const { gate, units } = member;
+      if (gate === null || typeof gate !== 'object' || gateState.get(gate) === undefined) {
+        throw new TypeError('member gate must be a gate created by createGate');
+      }
+      const g = gateState.get(gate);
+      if (typeof units !== 'number') {
+        throw new TypeError('units must be a number');
+      }
+      if (!Number.isInteger(units)) {
+        throw new RangeError('units must be an integer');
+      }
+      if (units < 1) {
+        throw new RangeError('units must be a positive integer');
+      }
+      if (seen.has(g)) {
+        throw new RangeError('the same gate must not appear twice in one acquireAll');
+      }
+      if (g.root !== r) {
+        throw new RangeError('all member gates must belong to the same gate family');
+      }
+      seen.add(g);
+      gates.push(g);
+      unitMap.set(g, units);
+      total += units;
+    }
+    // Grandparent/grandchild loop: one member must not sit on another's
+    // ancestor chain.
+    for (const g of gates) {
+      let node = g.parent;
+      while (node !== null) {
+        if (seen.has(node)) {
+          throw new RangeError('member gates must not be ancestors of one another');
+        }
+        node = node.parent;
+      }
+    }
+    return { gates, unitMap, total };
+  }
+
+  function acquireAll(members, signal) {
+    assertSignal(signal);
+    const { gates: comboGates, unitMap: comboUnits, total: totalUnits } = validateMembers(members);
+    // A signal that fired before the call settles as CANCELLED without ever
+    // entering the queue or reserving anything.
+    if (signal !== undefined && signal !== null && signal.aborted) {
+      state.cancelled += 1;
+      return Promise.reject(
+        new QuotaExceededError('CANCELLED', 'acquireAll was cancelled before it could queue'),
+      );
+    }
+    const r = state.root;
+
+    // waiting mirrors the occupation the combo would commit: every member
+    // carries its own slice. The entry-point gate is charged only when it is
+    // itself one of the members.
+    const waitCharges = comboGates.map((g) => ({ gate: g, units: comboUnits.get(g) }));
+
+    // Reserve up front. With no earlier arrival the whole reservation commits
+    // in the same cut; otherwise the hold waits for the combo's turn and the
+    // pool flip reclaims it before allocation.
+    const holder = makeEntry({
+      owner: state,
+      combo: true,
+      units: totalUnits,
+      resolve: () => {},
+      reject: () => {},
+      signal: null,
+      waitCharges: [],
+      comboGates,
+      comboUnits,
+      totalUnits,
+    });
+    const gathered = tryGather(holder, buildSegs(comboGates, (g) => comboUnits.get(g)));
+
+    if (gathered && r.liveQueued === 0) {
+      state.granted += 1;
+      return Promise.resolve(commitCombo(holder));
+    }
+    if (state.maxWaitMs === 0) {
+      // Zero wait refuses on the spot. A shortfall already rolled back; a
+      // gathered combo still cannot overtake earlier arrivals.
+      if (gathered) releaseHolds(holder);
+      if (!gathered) state.rolledBack += 1;
+      state.refused += 1;
+      return Promise.reject(new QuotaExceededError('QUOTA_EXCEEDED', 'quota exceeded'));
+    }
+    if (!gathered) {
+      // Any step short: the plan touched nothing; count one whole rollback and
+      // queue; the combo gathers again at every pool window flip.
+      state.rolledBack += 1;
+    }
+
+    for (const charge of waitCharges) charge.gate.waiting += charge.units;
+    r.liveQueued += 1;
+    return new Promise((resolve, reject) => {
+      holder.resolve = resolve;
+      holder.reject = reject;
+      holder.signal = signal !== undefined && signal !== null ? signal : null;
+      holder.onAbort = () => onEntryAbort(holder);
+      holder.waitCharges = waitCharges;
+      enqueueEntry(r, holder);
     });
   }
 
@@ -634,10 +1298,12 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
       refused: state.refused,
       expired: state.expired,
       cancelled: state.cancelled,
+      reserved: reservedOn(state),
+      rolledBack: state.rolledBack,
     };
   }
 
-  const gate = { acquire, stats, updateLimit, updateWindowMs, updateMaxWaitMs, reparent };
+  const gate = { acquire, acquireAll, stats, updateLimit, updateWindowMs, updateMaxWaitMs, reparent };
   gateState.set(gate, state);
   return gate;
 }

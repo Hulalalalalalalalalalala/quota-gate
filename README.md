@@ -18,11 +18,53 @@ Node.js 20 or newer. No runtime dependencies.
 
 `createGate({ limit, windowMs, maxWaitMs = 0, parent }) -> Gate`.
 - `Gate.acquire(units = 1, signal?) -> Promise<{ release }>`.
-- `Gate.stats() -> { limit, windowMs, inFlight, waiting, granted, refused, expired, cancelled }`.
+- `Gate.acquireAll(members, signal?) -> Promise<{ release }>`.
+- `Gate.stats() -> { limit, windowMs, inFlight, waiting, granted, refused, expired, cancelled, reserved, rolledBack }`.
 - `Gate.updateLimit(limit)`, `Gate.updateWindowMs(windowMs)`,
   `Gate.updateMaxWaitMs(maxWaitMs)`, `Gate.reparent(newParent)`.
 - `QuotaExceededError` exported class with a `code` property
   (`QUOTA_EXCEEDED`, `WAIT_EXPIRED`, or `CANCELLED`).
+
+Every acquired handle, single or combined, has exactly one own method,
+`release()`; it is a closure and works the same after destructuring.
+
+### Cross-gate combinations
+
+`acquireAll([{ gate, units }, ...], signal?)` reserves one combined occupation
+spanning several gates of the same family. Member lists must be non-empty; each
+`units` must be a positive integer; a gate may appear only once; members may
+not be ancestors of one another (a grandparent/grandchild loop is rejected);
+and all members must belong to one family. Empty lists, non-integer or
+non-positive unit counts and repeated gates raise `RangeError`; wrong argument
+or member types (including foreign gates) raise `TypeError`. Invalid calls
+produce no observable cut.
+
+Each member is covered first by its own current-window quota; any shortfall
+borrows its direct parent's own quota, then the grandparent's, and so on up
+the chain, registering every lend as a reservation; the root pool covers
+whatever remains. The whole request commits to an occupation only once every
+part is reserved. If any part cannot be covered, every provisional
+reservation is released and the attempt rolls back as a whole (`rolledBack`
+moves once, no other counter does) and the combo gathers again at the next
+pool window flip. `reserved` reports the units currently held by uncommitted
+reservations (member own quota and ancestor lends on a non-root gate; pool
+units on the root); on commit those units merge into the occupations and on a
+whole rollback the count returns to zero.
+
+Combined and single requests share one arrival-ordered queue and settle
+independently. A head combo that cannot be gathered does not starve later
+arrivals: a later request (single or combined) that can be satisfied outright
+is let through, and the blocked combo yields once. After yielding twice it
+stops yielding and becomes an ordinary barrier. A waiting combo may be
+cancelled with its `AbortSignal` (`CANCELLED`); if its wait cap runs out it
+settles as `WAIT_EXPIRED`; both reject with `QuotaExceededError` and release
+the whole reservation. A signal already aborted settles immediately without
+entering the queue. With `maxWaitMs` 0 a combo that cannot commit on the spot
+is refused `QUOTA_EXCEEDED`.
+
+When an ancestor window turns, borrowed quota is reclaimed uncommitted
+reservations first (member own slice, then ancestor lends), then the parts
+borrowed by admitted occupations; admitted handles stay valid throughout.
 
 Passing `parent` (a gate created by this module) makes a child gate that
 shares the parent's quota pool: every grant in the hierarchy draws from the
@@ -57,10 +99,13 @@ grants queued requests early and never tears apart admitted occupations.
   gate. The borrowed quota is settled in the old family's window and
   re-borrowed from the new family in one snapshot; if the new family's pool
   cannot cover it, the call throws `QuotaExceededError` (`QUOTA_EXCEEDED`)
-  and nothing changes. Reparenting under the gate itself or one of its
-  descendants, or with a limit above the new parent's, raises `RangeError`;
-  a target that is not a gate from this module raises `TypeError`. Invalid
-  calls produce no observable cut.
+  and nothing changes. A queued combination split across the two families by
+  the move is refused as a whole; a combination wholly inside the moved
+  subtree releases its old-family reservation and gathers anew in the joined
+  family. Reparenting under the gate itself or one of its descendants, or
+  with a limit above the new parent's, raises `RangeError`; a target that is
+  not a gate from this module raises `TypeError`. Invalid calls produce no
+  observable cut.
 
 `acquire` also accepts an optional `AbortSignal`. Cancelling a still-queued
 request settles it with a `QuotaExceededError` whose `code` is `CANCELLED`

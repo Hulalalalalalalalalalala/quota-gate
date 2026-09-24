@@ -15,6 +15,8 @@ test('stats exposes the documented keys in order', () => {
     'refused',
     'expired',
     'cancelled',
+    'reserved',
+    'rolledBack',
   ]);
   assert.deepEqual(gate.stats(), {
     limit: 2,
@@ -25,6 +27,8 @@ test('stats exposes the documented keys in order', () => {
     refused: 0,
     expired: 0,
     cancelled: 0,
+    reserved: 0,
+    rolledBack: 0,
   });
 });
 
@@ -740,4 +744,306 @@ test('the four terminal counters together account for every settled request', as
   assert.equal(s1.granted + s1.refused + s1.expired + s1.cancelled, 2);
   const s2 = g2.stats();
   assert.equal(s2.granted + s2.refused + s2.expired + s2.cancelled, 3);
+});
+
+// --- Cross-gate acquireAll --------------------------------------------------
+
+test('acquireAll grants one combined occupation and returns a release-only handle', async () => {
+  const root = createGate({ limit: 6, windowMs: 1000 });
+  const a = createGate({ limit: 2, windowMs: 1000, parent: root });
+  const b = createGate({ limit: 2, windowMs: 1000, parent: root });
+  const handle = await root.acquireAll([{ gate: a, units: 2 }, { gate: b, units: 2 }]);
+  assert.deepEqual(Object.keys(handle), ['release']);
+  assert.equal(typeof handle.release, 'function');
+  assert.equal(a.stats().inFlight, 2);
+  assert.equal(b.stats().inFlight, 2);
+  assert.equal(root.stats().granted, 1);
+  // A single-gate occupation has the very same shape.
+  const single = await root.acquire(1);
+  assert.deepEqual(Object.keys(single), ['release']);
+  // Destructuring works: release does not depend on its receiver.
+  const { release } = handle;
+  release();
+  release(); // idempotent
+  assert.equal(a.stats().inFlight, 0);
+  assert.equal(b.stats().inFlight, 0);
+  single.release();
+});
+
+test('a member above its own limit borrows up the direct parent chain then the pool', async () => {
+  const root = createGate({ limit: 10, windowMs: 1000 });
+  const p = createGate({ limit: 3, windowMs: 1000, parent: root });
+  const a = createGate({ limit: 2, windowMs: 1000, parent: p });
+  await p.acquire(2); // occupy two of p's own window, leaving one to lend
+  const handle = await root.acquireAll([{ gate: a, units: 4 }]); // own 2, parent lend 1, pool 1
+  assert.equal(a.stats().inFlight, 4);
+  assert.equal(p.stats().inFlight, 3); // its own 2 plus the one lent unit
+  handle.release();
+  assert.equal(a.stats().inFlight, 0);
+  assert.equal(p.stats().inFlight, 2); // only its own occupation remains
+});
+
+test('a queued combo holds reservations until it commits at the pool flip', async () => {
+  const root = createGate({ limit: 5, windowMs: 60, maxWaitMs: 1000 });
+  const a = createGate({ limit: 2, windowMs: 1000, maxWaitMs: 1000, parent: root });
+  await root.acquire(4); // pool 4/5
+  const pSingle = root.acquire(2); // earlier arrival; 4+2>5, queues
+  const pCombo = root.acquireAll([{ gate: a, units: 1 }]); // 4+1=5 gathers, waits behind
+  assert.equal(a.stats().waiting, 1); // the member carries its own slice
+  assert.equal(a.stats().reserved, 1); // its unit is reserved, not yet occupied
+  assert.equal(a.stats().inFlight, 0);
+  assert.equal(root.stats().reserved, 0); // the unit sat in the member's own quota
+  const [hSingle, hCombo] = await Promise.all([pSingle, pCombo]);
+  assert.equal(a.stats().reserved, 0); // committed: reservation merges into the occupation
+  assert.equal(a.stats().inFlight, 1);
+  assert.equal(a.stats().waiting, 0);
+  hSingle.release();
+  hCombo.release();
+});
+
+test('a combo that cannot be gathered rolls back as a whole and retries at the flip', async () => {
+  const root = createGate({ limit: 3, windowMs: 60, maxWaitMs: 1000 });
+  const a = createGate({ limit: 3, windowMs: 1000, maxWaitMs: 1000, parent: root });
+  await root.acquire(2);
+  const pSingle = root.acquire(2); // earlier arrival
+  const pCombo = root.acquireAll([{ gate: a, units: 3 }]); // 2+3>3: rolls back, queues
+  const s = root.stats();
+  assert.equal(s.rolledBack, 1); // one failed gather
+  assert.equal(s.refused, 0); // still waiting
+  assert.equal(s.granted, 1); // nothing else moved
+  assert.equal(a.stats().reserved, 0); // every provisional reservation was released
+  const h = await pCombo; // gathered and granted at the fresh pool window
+  await pSingle;
+  assert.equal(a.stats().inFlight, 3);
+  h.release();
+});
+
+test('a blocked head combo yields twice and then blocks later requests', async () => {
+  const root = createGate({ limit: 4, windowMs: 40, maxWaitMs: 5000 });
+  const a = createGate({ limit: 4, windowMs: 1000, maxWaitMs: 5000, parent: root });
+  const ac = new AbortController();
+  const bigErr = root.acquireAll([{ gate: a, units: 5 }], ac.signal).then(
+    () => null,
+    (e) => e,
+  ); // can never fit pool 4; rejection handler attached up front
+  const settled = [];
+  let h1;
+  let h2;
+  let h3;
+  const p1 = root.acquire(1).then((h) => { h1 = h; settled.push('s1'); });
+  const p2 = root.acquire(1).then((h) => { h2 = h; settled.push('s2'); });
+  const p3 = root.acquire(1).then((h) => { h3 = h; settled.push('s3'); });
+  await sleep(70); // first pool flip: two later requests overtake
+  assert.deepEqual(settled, ['s1', 's2']);
+  await sleep(40); // next flip: the combo already yielded twice, s3 must not pass it
+  assert.deepEqual(settled, ['s1', 's2']);
+  ac.abort(); // tear down the blocked combo
+  assert.equal((await bigErr).code, 'CANCELLED');
+  await p3; // once the combo leaves, s3 flows at the next flip
+  assert.deepEqual(settled, ['s1', 's2', 's3']);
+  h1.release();
+  h2.release();
+  h3.release();
+});
+
+test('a later combo that fits can overtake a blocked head combo once', async () => {
+  const root = createGate({ limit: 4, windowMs: 40, maxWaitMs: 5000 });
+  const a = createGate({ limit: 4, windowMs: 1000, maxWaitMs: 5000, parent: root });
+  const b = createGate({ limit: 4, windowMs: 1000, maxWaitMs: 5000, parent: root });
+  const ac = new AbortController();
+  let bigGranted = false;
+  const bigErr = a
+    .acquireAll([{ gate: a, units: 5 }], ac.signal)
+    .then(() => {
+      bigGranted = true;
+      return null;
+    }, (e) => e);
+  const pSmall = b.acquireAll([{ gate: b, units: 2 }]);
+  const hSmall = await pSmall; // fits the fresh pool outright, overtakes the head
+  assert.equal(bigGranted, false);
+  hSmall.release();
+  ac.abort();
+  assert.equal((await bigErr).code, 'CANCELLED');
+});
+
+test('the pool flip reclaims uncommitted reservations before admitted borrows', async () => {
+  const root = createGate({ limit: 5, windowMs: 60 });
+  const a = createGate({ limit: 2, windowMs: 1000, parent: root });
+  const h = await root.acquireAll([{ gate: a, units: 2 }]);
+  await sleep(100); // the pool window flips; the combo handle stays valid
+  assert.equal(a.stats().inFlight, 2); // occupation intact
+  h.release(); // no double accounting on the reclaimed pool link
+  assert.equal(a.stats().inFlight, 0);
+});
+
+test('a parent window flip reclaims uncommitted lends before admitted lends', async () => {
+  const root = createGate({ limit: 10, windowMs: 1000, maxWaitMs: 5000 });
+  const p = createGate({ limit: 2, windowMs: 40, maxWaitMs: 5000, parent: root });
+  const a = createGate({ limit: 2, windowMs: 1000, maxWaitMs: 5000, parent: p });
+  await root.acquire(6); // pool 6/10
+  const pSingle = root.acquire(5); // 6+5>10 queues first
+  // own 2 + parent lend 2 = 4; 6+4=10 gathers, waits behind the single.
+  const pCombo = root.acquireAll([{ gate: a, units: 4 }]);
+  assert.equal(a.stats().reserved, 2);
+  assert.equal(p.stats().reserved, 2);
+  await sleep(60); // p's window flips before the pool window: lend reservation reclaimed
+  assert.equal(p.stats().reserved, 0);
+  assert.equal(a.stats().reserved, 2); // the member's own window is still open
+  const [, h] = await Promise.all([pSingle, pCombo]); // both flow at the pool flip
+  assert.equal(a.stats().inFlight, 4);
+  h.release();
+});
+
+test('a parent window flip reclaims admitted lends without breaking the handle', async () => {
+  const root = createGate({ limit: 5, windowMs: 1000 });
+  const p = createGate({ limit: 2, windowMs: 40, parent: root });
+  const a = createGate({ limit: 2, windowMs: 1000, parent: p });
+  const h = await root.acquireAll([{ gate: a, units: 4 }]); // own 2, parent lend 2
+  assert.equal(a.stats().inFlight, 4);
+  assert.equal(p.stats().inFlight, 2);
+  await sleep(80); // the parent window flips twice: the lend is reclaimed
+  assert.equal(p.stats().inFlight, 0);
+  assert.equal(a.stats().inFlight, 2); // the own part survives
+  h.release(); // still a valid handle; no double subtract
+  assert.equal(a.stats().inFlight, 0);
+});
+
+test('acquireAll expiry and cancellation release the whole reservation', async () => {
+  const root = createGate({ limit: 2, windowMs: 1000, maxWaitMs: 5000 });
+  const a = createGate({ limit: 2, windowMs: 1000, parent: root });
+  await root.acquire(2);
+  root.updateMaxWaitMs(30);
+  await assert.rejects(root.acquireAll([{ gate: a, units: 1 }]), (err) => {
+    assert.ok(err instanceof QuotaExceededError);
+    assert.equal(err.code, 'WAIT_EXPIRED');
+    return true;
+  });
+  assert.equal(root.stats().expired, 1);
+  assert.equal(a.stats().reserved, 0);
+
+  root.updateMaxWaitMs(5000);
+  const ac = new AbortController();
+  const p = root.acquireAll([{ gate: a, units: 1 }], ac.signal);
+  ac.abort();
+  await assert.rejects(p, (err) => {
+    assert.ok(err instanceof QuotaExceededError);
+    assert.equal(err.code, 'CANCELLED');
+    return true;
+  });
+  assert.equal(root.stats().cancelled, 1);
+  assert.equal(a.stats().reserved, 0);
+  assert.equal(a.stats().waiting, 0);
+});
+
+test('a pre-aborted acquireAll settles CANCELLED without queueing or reserving', async () => {
+  const root = createGate({ limit: 2, windowMs: 1000, maxWaitMs: 5000 });
+  const a = createGate({ limit: 2, windowMs: 1000, parent: root });
+  const ac = new AbortController();
+  ac.abort();
+  await assert.rejects(root.acquireAll([{ gate: a, units: 1 }], ac.signal), (err) => {
+    assert.equal(err.code, 'CANCELLED');
+    return true;
+  });
+  const s = root.stats();
+  assert.equal(s.cancelled, 1);
+  assert.equal(s.waiting, 0);
+  assert.equal(s.granted, 0);
+  assert.equal(a.stats().reserved, 0);
+});
+
+test('acquireAll with maxWaitMs 0 refuses QUOTA_EXCEEDED on the spot', async () => {
+  const root = createGate({ limit: 2, windowMs: 1000 });
+  const a = createGate({ limit: 2, windowMs: 1000, parent: root });
+  await root.acquire(2);
+  await assert.rejects(root.acquireAll([{ gate: a, units: 1 }]), (err) => {
+    assert.equal(err.code, 'QUOTA_EXCEEDED');
+    return true;
+  });
+  assert.equal(root.stats().refused, 1);
+  assert.equal(a.stats().waiting, 0);
+  assert.equal(a.stats().reserved, 0);
+});
+
+test('acquireAll validates members without producing a cut', () => {
+  const root = createGate({ limit: 5, windowMs: 1000 });
+  const a = createGate({ limit: 2, windowMs: 1000, parent: root });
+  const b = createGate({ limit: 2, windowMs: 1000, parent: root });
+  const child = createGate({ limit: 1, windowMs: 1000, parent: a });
+  const other = createGate({ limit: 2, windowMs: 1000 });
+  const before = [root.stats(), a.stats(), b.stats()];
+  assert.throws(() => root.acquireAll([]), RangeError);
+  assert.throws(() => root.acquireAll([{ gate: a, units: 0 }]), RangeError);
+  assert.throws(() => root.acquireAll([{ gate: a, units: -1 }]), RangeError);
+  assert.throws(() => root.acquireAll([{ gate: a, units: 1.5 }]), RangeError);
+  assert.throws(() => root.acquireAll([{ gate: a, units: '1' }]), TypeError);
+  assert.throws(() => root.acquireAll([{ gate: a }]), TypeError);
+  assert.throws(() => root.acquireAll('nope'), TypeError);
+  assert.throws(() => root.acquireAll([null]), TypeError);
+  assert.throws(() => root.acquireAll([{ gate: {}, units: 1 }]), TypeError);
+  assert.throws(
+    () => root.acquireAll([{ gate: a, units: 1 }, { gate: a, units: 1 }]),
+    RangeError,
+  );
+  assert.throws(() => root.acquireAll([{ gate: a, units: 1 }, { gate: other, units: 1 }]), RangeError);
+  assert.throws(
+    () => root.acquireAll([{ gate: a, units: 1 }, { gate: child, units: 1 }]),
+    RangeError,
+  );
+  assert.deepEqual([root.stats(), a.stats(), b.stats()], before);
+});
+
+test('a root limit shrink refuses oversized queued combos as a whole', async () => {
+  const root = createGate({ limit: 5, windowMs: 1000, maxWaitMs: 5000 });
+  const a = createGate({ limit: 2, windowMs: 1000, maxWaitMs: 5000, parent: root });
+  const b = createGate({ limit: 2, windowMs: 1000, maxWaitMs: 5000, parent: root });
+  await root.acquire(3);
+  const p = root.acquireAll([{ gate: a, units: 2 }, { gate: b, units: 2 }]); // total 4
+  root.updateLimit(3); // the whole combo can never fit
+  await assert.rejects(p, (err) => {
+    assert.equal(err.code, 'QUOTA_EXCEEDED');
+    return true;
+  });
+  assert.equal(root.stats().refused, 1);
+  assert.equal(a.stats().waiting, 0);
+  assert.equal(a.stats().reserved, 0);
+  assert.equal(b.stats().waiting, 0);
+});
+
+test('a member limit shrink does not refuse a combo that the pool can still cover', async () => {
+  const root = createGate({ limit: 5, windowMs: 60, maxWaitMs: 5000 });
+  const a = createGate({ limit: 3, windowMs: 60, maxWaitMs: 5000, parent: root });
+  await root.acquire(3);
+  const p = root.acquireAll([{ gate: a, units: 3 }]); // above the new limit, pool still covers
+  a.updateLimit(1);
+  assert.equal(root.stats().refused, 0);
+  const h = await p; // granted at the flip, borrowing the excess up the chain
+  assert.equal(a.stats().inFlight, 3);
+  h.release();
+});
+
+test('updateMaxWaitMs expires a queued combo and releases its reservation', async () => {
+  const root = createGate({ limit: 2, windowMs: 1000, maxWaitMs: 5000 });
+  const a = createGate({ limit: 2, windowMs: 1000, maxWaitMs: 5000, parent: root });
+  await root.acquire(2);
+  const p = root.acquireAll([{ gate: a, units: 1 }]);
+  root.updateMaxWaitMs(0);
+  await assert.rejects(p, (err) => err.code === 'WAIT_EXPIRED');
+  assert.equal(root.stats().expired, 1);
+  assert.equal(a.stats().reserved, 0);
+});
+
+test('reparent refuses a combo split across the two families and moves a whole combo', async () => {
+  const oldRoot = createGate({ limit: 5, windowMs: 1000, maxWaitMs: 5000 });
+  const a = createGate({ limit: 2, windowMs: 1000, maxWaitMs: 5000, parent: oldRoot });
+  const b = createGate({ limit: 2, windowMs: 1000, maxWaitMs: 5000, parent: oldRoot });
+  const newRoot = createGate({ limit: 5, windowMs: 60, maxWaitMs: 5000 });
+  await oldRoot.acquire(4);
+  const pSplit = oldRoot.acquireAll([{ gate: a, units: 1 }, { gate: b, units: 1 }]);
+  const pMoved = oldRoot.acquireAll([{ gate: a, units: 1 }]);
+  a.reparent(newRoot);
+  await assert.rejects(pSplit, (err) => err.code === 'QUOTA_EXCEEDED');
+  const oldGranted = oldRoot.stats().granted;
+  const h = await pMoved; // gathers anew and grants in the joined family
+  assert.equal(newRoot.stats().granted + oldRoot.stats().granted, oldGranted + 1);
+  h.release();
 });
