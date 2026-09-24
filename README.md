@@ -18,7 +18,14 @@ Node.js 20 or newer. No runtime dependencies.
 
 `createGate({ limit, windowMs, maxWaitMs = 0, parent }) -> Gate`.
 - `Gate.acquire(units = 1, signal?) -> Promise<{ release }>`.
-- `Gate.stats() -> { limit, windowMs, inFlight, waiting, granted, refused, expired, cancelled }`.
+- `Gate.acquireAll(members, signal?) -> Promise<{ release }>` acquires a
+  cross-gate combination. `members` is a non-empty array of
+  `{ gate, units }`; every gate must belong to this gate's family, no gate may
+  repeat, and no two members may be ancestors of one another. The returned
+  handle exposes one detached `release` that releases every member occupation;
+  it is safe to destructure, call without a receiver and call repeatedly.
+- `Gate.stats() -> { limit, windowMs, inFlight, waiting, granted, refused,
+  expired, cancelled, reserved, rolledBack }`.
 - `Gate.updateLimit(limit)`, `Gate.updateWindowMs(windowMs)`,
   `Gate.updateMaxWaitMs(maxWaitMs)`, `Gate.reparent(newParent)`.
 - `QuotaExceededError` exported class with a `code` property
@@ -34,6 +41,37 @@ admitted occupations (handles stay valid) and the corresponding `inFlight`
 drop is visible in the same stats snapshot. Queued requests across the whole
 hierarchy wait in one arrival-ordered queue and are served all-or-nothing
 before any later arrival, so no request is postponed indefinitely.
+
+### Cross-gate combinations
+
+`acquireAll` reserves each member's units all-or-nothing. Every member first
+draws on its own remaining quota; the shortfall is borrowed one direct parent
+at a time up the ancestor chain, and every leg draws the current root-pool
+window as well. A request is admitted only once every member is fully
+covered; if any step cannot be covered, every reservation of the attempt is
+released and the whole request rolls back.
+
+Combinations and single requests share one arrival-ordered queue and settle
+independently. A combination that cannot be gathered when it reaches the head
+steps aside so a later request that fits can be admitted, but the same
+combination yields at most twice; afterwards it blocks later arrivals like
+any other head. While a combination waits, everything that could be gathered
+immediately is reserved and held; a window flip reclaims uncommitted
+reservations before it reclaims quota borrowed by admitted occupations, and
+handles remain valid in both cases. A combination whose member becomes
+unfittable after a shrink is refused wholesale.
+
+`stats.reserved` is the number of units currently held by uncommitted
+reservations on that gate's window; the units merge into the occupation
+counters on commit and return to zero on rollback. `stats.rolledBack` counts
+failed gather attempts; a rollback moves no other counter.
+
+Invalid `acquireAll` calls raise before any counter moves: an empty member
+list, non-integer or out-of-range units, a repeated gate, members from
+different families, or an ancestor chain raise `RangeError`; a non-array
+member list, a non-object member, a non-module gate or wrong-typed units raise
+`TypeError`.
+
 
 ## Runtime adjustment
 
@@ -68,7 +106,10 @@ and moves only `waiting` and the `cancelled` counter. A signal that already
 fired settles the acquire as `CANCELLED` without ever entering the queue;
 cancelling an already granted or already settled request does nothing. When
 expiry, cancellation, and a grant fall on the same moment, they settle in
-that order.
+that order. `acquireAll` accepts the same signal with the same outcomes; a
+combination that times out settles `WAIT_EXPIRED`, and one that is aborted
+settles `CANCELLED`, and with `maxWaitMs` 0 a combination that cannot be
+gathered immediately is refused with `QUOTA_EXCEEDED`.
 
 ## Tests
 

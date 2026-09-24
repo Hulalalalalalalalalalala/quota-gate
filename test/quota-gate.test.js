@@ -15,6 +15,8 @@ test('stats exposes the documented keys in order', () => {
     'refused',
     'expired',
     'cancelled',
+    'reserved',
+    'rolledBack',
   ]);
   assert.deepEqual(gate.stats(), {
     limit: 2,
@@ -25,6 +27,8 @@ test('stats exposes the documented keys in order', () => {
     refused: 0,
     expired: 0,
     cancelled: 0,
+    reserved: 0,
+    rolledBack: 0,
   });
 });
 
