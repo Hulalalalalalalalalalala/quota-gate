@@ -68,14 +68,22 @@ borrowed by admitted occupations; admitted handles stay valid throughout.
 
 Passing `parent` (a gate created by this module) makes a child gate that
 shares the parent's quota pool: every grant in the hierarchy draws from the
-root pool, and a child's `limit` must not exceed its parent's. When a child's
-own remaining quota cannot cover a request, the child borrows the shortfall
-from the parent pool to complete that one occupation. Borrowed quota is
-forcibly reclaimed when the parent's window ends; the reclaim never breaks
-admitted occupations (handles stay valid) and the corresponding `inFlight`
-drop is visible in the same stats snapshot. Queued requests across the whole
-hierarchy wait in one arrival-ordered queue and are served all-or-nothing
-before any later arrival, so no request is postponed indefinitely.
+root pool, and a child's `limit` must not exceed its parent's. A request's
+unit count is not capped by the entry gate's own limit: the occupation first
+uses that gate's own remaining current-window quota, then borrows the
+shortfall from its direct parent, then the grandparent, and so on up the
+chain (each borrow registered as a reservation), with the root pool covering
+whatever remains. A unit count the whole family cannot cover is not a
+parameter error; with wait cap zero it is refused `QUOTA_EXCEEDED` on the
+spot, otherwise the request queues. Non-positive or non-integer unit counts
+raise `RangeError`; a non-numeric `units` raises `TypeError`. Borrowed quota
+is forcibly reclaimed when the lender's own window ends, uncommitted
+reservations first and then the parts borrowed by admitted occupations; the
+reclaim never breaks admitted occupations (handles stay valid) and the
+corresponding `inFlight` drop is visible in the same stats snapshot. Queued
+requests across the whole hierarchy wait in one arrival-ordered queue and are
+served all-or-nothing before any later arrival, so no request is postponed
+indefinitely.
 
 ## Runtime adjustment
 

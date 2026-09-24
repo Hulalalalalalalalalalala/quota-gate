@@ -337,47 +337,12 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     };
   }
 
-  // Commit a single-gate occupation with the baseline partition: own quota
-  // first, every shortfall drawn straight from the root pool.
-  function commitSingle(target, units) {
-    const r = target.root;
-    r.poolUsed += units;
-    chargeDraw(target, units);
-    let seg;
-    if (target === r) {
-      target.usedOwn += units;
-      target.inFlight += units;
-      seg = { member: target, units, own: units, mgen: target.ownGen, links: [] };
-    } else {
-      const ownPart = Math.min(units, Math.max(0, target.limit - target.usedOwn));
-      const borrowPart = units - ownPart;
-      target.usedOwn += ownPart;
-      target.inFlight += units;
-      target.borrowedInFlight += borrowPart;
-      const links = [];
-      if (borrowPart > 0) {
-        const link = {
-          kind: 'pool',
-          lender: r,
-          member: target,
-          units: borrowPart,
-          lgen: r.poolGen,
-          mgen: target.ownGen,
-        };
-        r.poolLinks.add(link);
-        links.push(link);
-      }
-      seg = { member: target, units, own: ownPart, mgen: target.ownGen, links };
-    }
-    const rec = { seg };
-    target.openHandles.add(rec);
-    return makeHandle([rec]);
-  }
-
-  // Commit a fully gathered combo: provisional promises become admitted
-  // occupations. Pool room was charged at gather time, so poolUsed does not
-  // move here.
-  function commitCombo(entry) {
+  // Every admitted occupation, single or combined, commits through the same
+  // gather machinery: provisional member-own promises and ancestor lends
+  // become admitted occupation parts; the uncommitted pool remainder is
+  // converted into an admitted pool borrow. Pool room was charged at gather
+  // time, so poolUsed does not move here.
+  function commitEntry(entry) {
     const r = entry.owner.root;
     const records = [];
     const lenderCleanup = new Set();
@@ -463,14 +428,15 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     detachSignal(entry);
     for (const charge of entry.waitCharges) charge.gate.waiting -= charge.units;
     if (outcome === 'granted') {
-      const handle = entry.combo ? commitCombo(entry) : commitSingle(entry.owner, entry.units);
+      const handle = commitEntry(entry);
       entry.owner.granted += 1;
       entry.resolve(handle);
       return;
     }
     // Expiry, cancellation and refusal give back any hold; none of those
-    // outcomes itself counts as a reservation rollback.
-    if (entry.combo) releaseHolds(entry);
+    // outcomes itself counts as a reservation rollback. Singles and combos
+    // alike hold their gather until they settle.
+    releaseHolds(entry);
     if (outcome === 'refused') {
       entry.owner.refused += 1;
       entry.reject(new QuotaExceededError('QUOTA_EXCEEDED', 'quota exceeded'));
@@ -535,47 +501,45 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     r.minDeadline = min;
   }
 
-  // Allocation walks arrivals in order against the freshly reset pool. A head
-  // combo that cannot be gathered whole does not starve later arrivals: a
-  // later request that fits outright passes it and the combo yields once;
-  // after yielding twice (cumulatively, across flips) it becomes a hard
-  // barrier like a non-fitting single. The pass is O(1) per live queue entry:
-  // a single monotonic counter (serveWave, bumped once per overtaking serve)
-  // lets each blocked combo derive its yield count without being touched by
-  // the requests that pass it.
+  // Allocation walks arrivals in order against the freshly reset pool. Both
+  // singles and combos turn against it: a head entry that cannot be gathered
+  // whole does not starve later arrivals — a later request that fits outright
+  // passes it and the blocker yields once; after yielding twice (cumulatively,
+  // across flips) it becomes a hard barrier. The pass is O(1) per live queue
+  // entry: a single monotonic counter (serveWave, bumped once per overtaking
+  // serve) lets each blocked entry derive its yield count without being touched
+  // by the requests that pass it.
   function allocate() {
     const r = state.root;
     const q = r.queue;
     let wave = r.serveWave; // overtakes counted so far, monotonic across passes
     let stopWave = Infinity; // earliest wave at which a blocker hardens
-    let blockerCount = 0; // blocked combos registered earlier in this/prev passes
+    let blockerCount = 0; // blocked entries registered earlier in this/prev passes
     for (let i = r.head; i < q.length; i += 1) {
       const entry = q[i];
       if (entry.removed) continue;
       if (wave >= stopWave) break;
       let served = false;
-      if (!entry.combo) {
-        if (r.poolUsed + entry.units > r.poolLimit) break;
+      // The entry's turn against the fresh pool: the pool flip reclaimed its
+      // pool side and ancestor-window flips reclaimed own-side parts; release
+      // whatever still holds and gather anew along the current chain.
+      if (entry.holdsHeld) releaseHolds(entry);
+      if (tryGather(entry, buildSegs(entry.comboGates, (g) => entry.comboUnits.get(g)))) {
         settleEntry(entry, 'granted');
         served = true;
+      } else if (!entry.combo) {
+        // A single that does not fit is an ordinary hard barrier: nothing
+        // later may overtake it.
+        break;
       } else {
-        // Combo's turn against the fresh pool: the pool flip reclaimed its
-        // pool side; release the surviving own-side holds and gather anew.
-        if (entry.holdsHeld) releaseHolds(entry);
-        const segs = buildSegs(entry.comboGates, (g) => entry.comboUnits.get(g));
-        if (tryGather(entry, segs)) {
-          settleEntry(entry, 'granted');
-          served = true;
-        } else {
-          // Any step short: the plan touched nothing; count one whole
-          // rollback (no other counter moves) and register a soft barrier.
-          entry.owner.rolledBack += 1;
-          if (entry.blockG !== -1) entry.yields += wave - entry.blockG;
-          entry.blockG = wave;
-          const hardensAt = wave + (2 - entry.yields);
-          blockerCount += 1;
-          if (hardensAt < stopWave) stopWave = hardensAt;
-        }
+        // Any step short: the plan touched nothing; count one whole
+        // rollback (no other counter moves) and register a soft barrier.
+        entry.owner.rolledBack += 1;
+        if (entry.blockG !== -1) entry.yields += wave - entry.blockG;
+        entry.blockG = wave;
+        const hardensAt = wave + (2 - entry.yields);
+        blockerCount += 1;
+        if (hardensAt < stopWave) stopWave = hardensAt;
       }
       if (served && blockerCount > 0) wave += 1; // one yield per overtaken blocker
     }
@@ -720,8 +684,10 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
 
   // Shrink fallout: queued requests that can never fit are refused
   // immediately and leave the queue, so they never block later arrivals.
-  // Occupations are never torn apart; a combo that can no longer be satisfied
-  // is refused as a whole, releasing its reservation in the same cut.
+  // Occupations are never torn apart. A unit count above a member's own limit
+  // is covered by parent-chain lends and the pool, so only a root (pool) cap
+  // shrink can make a queued single or combo impossible to satisfy; such an
+  // entry is refused as a whole, releasing its reservation in the same cut.
   function refuseUnfittable(newLimit) {
     const r = state.root;
     const q = r.queue;
@@ -730,15 +696,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     for (let i = r.head; i < q.length; i += 1) {
       const entry = q[i];
       if (entry.removed) continue;
-      let oversized;
-      if (entry.combo) {
-        // The whole combo must fit the pool; only the pool cap can refuse it,
-        // because member slices above a member's limit are simply borrowed.
-        oversized = poolShrink ? entry.totalUnits > newLimit : false;
-      } else {
-        oversized = entry.owner === state && entry.units > newLimit;
-      }
-      if (oversized) {
+      if (poolShrink && entry.totalUnits > newLimit) {
         settleEntry(entry, 'refused');
         touched = true;
       }
@@ -995,15 +953,16 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     const moved = collectSubtree(state);
 
     if (oldRootState !== newRootState) {
-      // Read-only classification first: split combos cannot reserve across
-      // families; wholly moved combos gather anew in the joined family.
+      // Read-only classification first: split entries cannot reserve across
+      // families; wholly moved ones (singles included — a single gathers like
+      // a one-member combo) gather anew in the joined family.
       const whollyMoved = [];
       const stayingCombos = [];
       const straddlers = [];
       const oldQ = oldRootState.queue;
       for (let i = oldRootState.head; i < oldQ.length; i += 1) {
         const entry = oldQ[i];
-        if (entry.removed || !entry.combo) continue;
+        if (entry.removed) continue;
         let inMoved = 0;
         for (const g of entry.comboGates) if (moved.has(g)) inMoved += 1;
         if (inMoved > 0 && inMoved < entry.comboGates.length) straddlers.push(entry);
@@ -1125,11 +1084,81 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     r.queue.push(entry);
   }
 
+  // Shared admission path for one single-gate request and one combination.
+  // The whole reservation is gathered up front: the member's own remainder,
+  // lends registered step by step up the direct-parent chain, and the root
+  // pool for whatever remains. With no earlier arrival a fully gathered entry
+  // commits to an occupation in the same cut; otherwise the hold waits for the
+  // entry's turn and the pool flip reclaims it before allocation. A shortfall
+  // with wait cap zero refuses QUOTA_EXCEEDED on the spot; otherwise the entry
+  // queues in arrival order and settles independently of every other entry.
+  function admit({ combo, comboGates, comboUnits, totalUnits, signal }) {
+    const r = state.root;
+    // waiting mirrors the occupation the entry would commit: every member
+    // carries its own slice. A single charges its own gate only.
+    const waitCharges = combo
+      ? comboGates.map((g) => ({ gate: g, units: comboUnits.get(g) }))
+      : [{ gate: state, units: totalUnits }];
+    const holder = makeEntry({
+      owner: state,
+      combo,
+      units: totalUnits,
+      resolve: () => {},
+      reject: () => {},
+      signal: null,
+      waitCharges: [],
+      comboGates,
+      comboUnits,
+      totalUnits,
+    });
+    const gathered = tryGather(holder, buildSegs(comboGates, (g) => comboUnits.get(g)));
+
+    if (gathered && r.liveQueued === 0) {
+      state.granted += 1;
+      return Promise.resolve(commitEntry(holder));
+    }
+    if (state.maxWaitMs === 0) {
+      // Zero wait refuses on the spot. A shortfall already rolled back; a
+      // gathered entry still cannot overtake earlier arrivals. rolledBack
+      // tracks whole-combination rollbacks only; a refused single moves just
+      // the refused counter.
+      if (gathered) releaseHolds(holder);
+      if (!gathered && combo) state.rolledBack += 1;
+      state.refused += 1;
+      return Promise.reject(new QuotaExceededError('QUOTA_EXCEEDED', 'quota exceeded'));
+    }
+    if (!gathered && combo) {
+      // Any step short: the plan touched nothing; count one whole rollback and
+      // queue; the combo gathers again at every pool window flip.
+      state.rolledBack += 1;
+    }
+
+    for (const charge of waitCharges) charge.gate.waiting += charge.units;
+    r.liveQueued += 1;
+    return new Promise((resolve, reject) => {
+      holder.resolve = resolve;
+      holder.reject = reject;
+      holder.signal = signal !== undefined && signal !== null ? signal : null;
+      holder.onAbort = () => onEntryAbort(holder);
+      holder.waitCharges = waitCharges;
+      enqueueEntry(r, holder);
+    });
+  }
+
   function acquire(units = 1, signal) {
-    assertInteger(units, 'units');
+    if (typeof units !== 'number') {
+      throw new TypeError('units must be a number');
+    }
+    if (!Number.isInteger(units)) {
+      throw new RangeError('units must be an integer');
+    }
     assertSignal(signal);
-    if (units < 1 || units > state.limit) {
-      throw new RangeError(`units must be between 1 and ${state.limit}`);
+    // A unit count above this gate's own limit is NOT a parameter error: the
+    // remainder first uses the gate's own headroom, then borrows up the
+    // direct-parent chain (registering every lend) and finally from the family
+    // pool. Only non-positive counts are RangeErrors here.
+    if (units < 1) {
+      throw new RangeError('units must be a positive integer');
     }
     // A signal that fired before the call settles as CANCELLED without ever
     // entering the queue or touching quota.
@@ -1139,30 +1168,13 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
         new QuotaExceededError('CANCELLED', 'acquire was cancelled before it could queue'),
       );
     }
-    // A non-empty queue means earlier arrivals are still owed quota; new
-    // requests must not overtake them even if they would fit.
-    const r = state.root;
-    if (r.liveQueued === 0 && r.poolUsed + units <= r.poolLimit) {
-      state.granted += 1;
-      return Promise.resolve(commitSingle(state, units));
-    }
-    if (state.maxWaitMs === 0) {
-      state.refused += 1;
-      return Promise.reject(new QuotaExceededError('QUOTA_EXCEEDED', 'quota exceeded'));
-    }
-    state.waiting += units;
-    r.liveQueued += 1;
-    return new Promise((resolve, reject) => {
-      const entry = makeEntry({
-        owner: state,
-        combo: false,
-        units,
-        resolve,
-        reject,
-        signal,
-        waitCharges: [{ gate: state, units }],
-      });
-      enqueueEntry(r, entry);
+    const comboUnits = new Map([[state, units]]);
+    return admit({
+      combo: false,
+      comboGates: [state],
+      comboUnits,
+      totalUnits: units,
+      signal,
     });
   }
 
@@ -1234,58 +1246,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
         new QuotaExceededError('CANCELLED', 'acquireAll was cancelled before it could queue'),
       );
     }
-    const r = state.root;
-
-    // waiting mirrors the occupation the combo would commit: every member
-    // carries its own slice. The entry-point gate is charged only when it is
-    // itself one of the members.
-    const waitCharges = comboGates.map((g) => ({ gate: g, units: comboUnits.get(g) }));
-
-    // Reserve up front. With no earlier arrival the whole reservation commits
-    // in the same cut; otherwise the hold waits for the combo's turn and the
-    // pool flip reclaims it before allocation.
-    const holder = makeEntry({
-      owner: state,
-      combo: true,
-      units: totalUnits,
-      resolve: () => {},
-      reject: () => {},
-      signal: null,
-      waitCharges: [],
-      comboGates,
-      comboUnits,
-      totalUnits,
-    });
-    const gathered = tryGather(holder, buildSegs(comboGates, (g) => comboUnits.get(g)));
-
-    if (gathered && r.liveQueued === 0) {
-      state.granted += 1;
-      return Promise.resolve(commitCombo(holder));
-    }
-    if (state.maxWaitMs === 0) {
-      // Zero wait refuses on the spot. A shortfall already rolled back; a
-      // gathered combo still cannot overtake earlier arrivals.
-      if (gathered) releaseHolds(holder);
-      if (!gathered) state.rolledBack += 1;
-      state.refused += 1;
-      return Promise.reject(new QuotaExceededError('QUOTA_EXCEEDED', 'quota exceeded'));
-    }
-    if (!gathered) {
-      // Any step short: the plan touched nothing; count one whole rollback and
-      // queue; the combo gathers again at every pool window flip.
-      state.rolledBack += 1;
-    }
-
-    for (const charge of waitCharges) charge.gate.waiting += charge.units;
-    r.liveQueued += 1;
-    return new Promise((resolve, reject) => {
-      holder.resolve = resolve;
-      holder.reject = reject;
-      holder.signal = signal !== undefined && signal !== null ? signal : null;
-      holder.onAbort = () => onEntryAbort(holder);
-      holder.waitCharges = waitCharges;
-      enqueueEntry(r, holder);
-    });
+    return admit({ combo: true, comboGates, comboUnits, totalUnits, signal });
   }
 
   function stats() {

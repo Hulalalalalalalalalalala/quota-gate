@@ -48,7 +48,7 @@ test('grants up to the limit and refuses beyond it', async () => {
   assert.equal(gate.stats().inFlight, 0);
 });
 
-test('validates constructor and acquire arguments', () => {
+test('validates constructor and acquire arguments', async () => {
   assert.throws(() => createGate(), TypeError);
   assert.throws(() => createGate({ limit: 1.5, windowMs: 10 }), TypeError);
   assert.throws(() => createGate({ limit: '2', windowMs: 10 }), TypeError);
@@ -58,18 +58,22 @@ test('validates constructor and acquire arguments', () => {
   assert.throws(() => createGate({ limit: 1, windowMs: 10, maxWaitMs: 1.5 }), TypeError);
 
   const gate = createGate({ limit: 3, windowMs: 1000 });
-  for (const units of [0, 4]) {
-    assert.throws(
-      () => gate.acquire(units),
-      (err) => {
-        assert.ok(err instanceof RangeError);
-        assert.match(err.message, /3/); // echoes the actual limit
-        return true;
-      },
-    );
-  }
-  assert.throws(() => gate.acquire(1.5), TypeError);
+  // Non-positive or non-integer unit counts are parameter errors; a count
+  // above the gate's own limit is NOT — it is a quota request that borrows up
+  // the chain, and is refused with QUOTA_EXCEEDED only when nothing covers it.
+  assert.throws(() => gate.acquire(0), RangeError);
+  assert.throws(() => gate.acquire(-2), RangeError);
+  assert.throws(() => gate.acquire(1.5), RangeError);
+  assert.throws(() => gate.acquire(NaN), RangeError);
   assert.throws(() => gate.acquire('1'), TypeError);
+  assert.throws(() => gate.acquire(null), TypeError);
+  await assert.rejects(gate.acquire(4), (err) => {
+    assert.ok(err instanceof QuotaExceededError);
+    assert.equal(err.code, 'QUOTA_EXCEEDED');
+    return true;
+  });
+  assert.equal(gate.stats().refused, 1);
+  assert.equal(gate.stats().granted, 0); // the over-limit request never occupied anything
 });
 
 test('release is idempotent and stale handles do not corrupt stats', async () => {
@@ -175,21 +179,22 @@ test('clock rollback does not revive expired windows or corrupt waits', async (t
   assert.equal(gate.stats().inFlight, 0);
 });
 
-test('child gates validate their parent and limit', () => {
+test('child gates validate their parent and limit', async () => {
   const parent = createGate({ limit: 3, windowMs: 1000 });
   assert.throws(() => createGate({ limit: 2, windowMs: 1000, parent: {} }), TypeError);
   assert.throws(() => createGate({ limit: 2, windowMs: 1000, parent: 'gate' }), TypeError);
   assert.throws(() => createGate({ limit: 4, windowMs: 1000, parent }), RangeError);
 
   const child = createGate({ limit: 2, windowMs: 1000, parent });
-  assert.throws(
-    () => child.acquire(3),
-    (err) => {
-      assert.ok(err instanceof RangeError);
-      assert.match(err.message, /2/); // echoes the child's own limit
-      return true;
-    },
-  );
+  // A unit count above the child's own limit is not a parameter error: the
+  // excess borrows up the parent chain and the pool. Here 3 units fit the
+  // 3-unit family pool (2 own + 1 pool), so the occupation is granted.
+  const h = await child.acquire(3);
+  assert.equal(child.stats().inFlight, 3);
+  h.release();
+  assert.throws(() => child.acquire(0), RangeError);
+  assert.throws(() => child.acquire(1.2), RangeError);
+  assert.throws(() => child.acquire('3'), TypeError);
 });
 
 test('child and parent share one quota pool', async () => {
@@ -362,35 +367,46 @@ test('updateLimit grow never grants queued requests early', async () => {
   h.release();
 });
 
-test('updateLimit on a child refuses only that child\'s oversized waiters', async () => {
+test('updateLimit on a child does not refuse a waiter the pool can still cover', async () => {
   const parent = createGate({ limit: 5, windowMs: 60, maxWaitMs: 1000 });
   const child = createGate({ limit: 3, windowMs: 60, maxWaitMs: 1000, parent });
   await parent.acquire(5); // pool full
-  const pChild = child.acquire(3); // queued, 3 units
+  const pChild = child.acquire(3); // queued, 3 units (above the child limit to come)
   const pParent = parent.acquire(1); // queued behind
-  child.updateLimit(2); // the child's 3-unit request can never fit now
-  assert.equal(child.stats().refused, 1);
-  assert.equal(child.stats().waiting, 0);
-  assert.equal(parent.stats().waiting, 1); // the parent's waiter is untouched
-  await assert.rejects(pChild, (err) => {
-    assert.equal(err.code, 'QUOTA_EXCEEDED');
-    return true;
-  });
-  const h = await pParent; // served at the pool window flip
-  h.release();
+  child.updateLimit(2); // above the child's own limit: covered by borrowing, not refused
+  assert.equal(child.stats().refused, 0);
+  assert.equal(child.stats().waiting, 3);
+  assert.equal(parent.stats().waiting, 1);
+  const hChild = await pChild; // served at the pool flip: 2 own + 1 borrowed
+  assert.equal(child.stats().inFlight, 3);
+  const hParent = await pParent;
+  hChild.release();
+  hParent.release();
 });
 
-test('acquire validates units against the current limit', async () => {
+test('acquire treats an over-own-limit count as a quota request, not a parameter error', async () => {
   const gate = createGate({ limit: 2, windowMs: 1000 });
   gate.updateLimit(3);
   await gate.acquire(3); // allowed under the new limit
-  assert.throws(() => gate.acquire(4), RangeError);
+  // Above the current limit: not a RangeError. With maxWaitMs 0 and a pool
+  // that cannot cover it, it is refused QUOTA_EXCEEDED on the spot.
+  await assert.rejects(
+    () => gate.acquire(4),
+    (err) => {
+      assert.ok(err instanceof QuotaExceededError);
+      assert.equal(err.code, 'QUOTA_EXCEEDED');
+      return true;
+    },
+  );
   gate.updateLimit(1);
-  assert.throws(
+  // A 2-unit request on a gate whose own limit is 1 still is not a parameter
+  // error — but the 3-unit family pool already has 3 occupied, so it is
+  // refused for lack of quota rather than rejected as a bad argument.
+  await assert.rejects(
     () => gate.acquire(2),
     (err) => {
-      assert.ok(err instanceof RangeError);
-      assert.match(err.message, /1/); // echoes the current limit
+      assert.ok(err instanceof QuotaExceededError);
+      assert.equal(err.code, 'QUOTA_EXCEEDED');
       return true;
     },
   );
@@ -1046,4 +1062,180 @@ test('reparent refuses a combo split across the two families and moves a whole c
   const h = await pMoved; // gathers anew and grants in the joined family
   assert.equal(newRoot.stats().granted + oldRoot.stats().granted, oldGranted + 1);
   h.release();
+});
+
+// --- Single-gate requests above the gate's own limit (chain borrowing) ------
+
+test('a single request above its own limit borrows own -> parent -> grandparent -> pool', async () => {
+  const root = createGate({ limit: 10, windowMs: 1000 });
+  const p = createGate({ limit: 3, windowMs: 1000, parent: root });
+  const a = createGate({ limit: 2, windowMs: 1000, parent: p });
+  await p.acquire(2); // leaves one unit of p's own window to lend
+  const handle = await a.acquire(4); // own 2, parent lend 1, pool 1
+  assert.equal(a.stats().inFlight, 4);
+  assert.equal(p.stats().inFlight, 3); // its own 2 plus the one lent unit
+  assert.equal(a.stats().granted, 1);
+  assert.equal(a.stats().refused, 0);
+  // No RangeError, no rollback accounting for a single.
+  assert.equal(root.stats().rolledBack, 0);
+  handle.release();
+  assert.equal(a.stats().inFlight, 0);
+  assert.equal(p.stats().inFlight, 2); // only p's own occupation remains
+});
+
+test('an over-limit single the family pool cannot cover is refused QUOTA_EXCEEDED', async () => {
+  const root = createGate({ limit: 3, windowMs: 1000 });
+  const child = createGate({ limit: 2, windowMs: 1000, parent: root });
+  await root.acquire(1); // 2 left in the pool
+  await assert.rejects(child.acquire(3), (err) => {
+    assert.ok(err instanceof QuotaExceededError);
+    assert.equal(err.code, 'QUOTA_EXCEEDED');
+    return true;
+  });
+  assert.equal(child.stats().refused, 1);
+  assert.equal(child.stats().rolledBack, 0); // singles do not move rolledBack
+  assert.equal(child.stats().inFlight, 0);
+  assert.equal(child.stats().reserved, 0); // the failed gather left no residue
+});
+
+test('an over-limit single queues, reserves, and borrows at the pool flip', async () => {
+  const root = createGate({ limit: 10, windowMs: 60, maxWaitMs: 1000 });
+  const p = createGate({ limit: 3, windowMs: 1000, maxWaitMs: 1000, parent: root });
+  const a = createGate({ limit: 2, windowMs: 1000, maxWaitMs: 1000, parent: p });
+  await root.acquire(4); // pool 4/10
+  await p.acquire(2); // pool 6/10, p own 2/3
+  const pBlocker = root.acquire(5); // earlier arrival; 6+5>10, queues
+  const hPromise = a.acquire(4); // own 2 + p lend 1 + pool 1 = 4 gathers, waits behind
+  assert.equal(a.stats().waiting, 4); // the whole occupation waits
+  assert.equal(a.stats().reserved, 2);
+  assert.equal(p.stats().reserved, 1); // one unit promised as a lend
+  assert.equal(root.stats().reserved, 1); // one unit promised from the pool
+  const [hBlocker, h] = await Promise.all([pBlocker, hPromise]);
+  assert.equal(a.stats().inFlight, 4);
+  assert.equal(a.stats().reserved, 0);
+  assert.equal(p.stats().reserved, 0);
+  assert.equal(p.stats().inFlight, 3); // own 2 plus lent 1
+  h.release();
+  assert.equal(a.stats().inFlight, 0);
+  assert.equal(p.stats().inFlight, 2);
+  hBlocker.release();
+});
+
+test('an over-limit single that cannot gather queues and rolls the pool at the flip', async () => {
+  const root = createGate({ limit: 3, windowMs: 60, maxWaitMs: 1000 });
+  const child = createGate({ limit: 2, windowMs: 1000, maxWaitMs: 1000, parent: root });
+  await root.acquire(3); // pool full
+  const p = child.acquire(3); // own 2 + pool 1 cannot gather yet
+  assert.equal(child.stats().waiting, 3);
+  assert.equal(child.stats().reserved, 0); // nothing held after the failed gather
+  const h = await p; // fresh pool window: own 2 + pool 1
+  assert.equal(child.stats().inFlight, 3);
+  assert.equal(child.stats().granted, 1);
+  assert.equal(child.stats().rolledBack, 0); // rollback accounting is combo-only
+  h.release();
+});
+
+test('a parent window flip reclaims a queued single\'s lend before an admitted lend', async () => {
+  const root = createGate({ limit: 10, windowMs: 1000, maxWaitMs: 5000 });
+  const p = createGate({ limit: 2, windowMs: 40, maxWaitMs: 5000, parent: root });
+  const a = createGate({ limit: 2, windowMs: 1000, maxWaitMs: 5000, parent: p });
+  await root.acquire(6); // pool 6/10
+  const pSingle = root.acquire(5); // earlier arrival; 6+5>10, queues
+  const pQueued = a.acquire(4); // own 2 + p lend 2 = 4 gathers (6+4=10), waits behind
+  assert.equal(p.stats().reserved, 2); // the uncommitted lend
+  await sleep(60); // p's window flips before the pool window
+  assert.equal(p.stats().reserved, 0); // uncommitted lend reclaimed first
+  const [, hQueued] = await Promise.all([pSingle, pQueued]); // both flow at the pool flip
+  assert.equal(a.stats().inFlight, 4);
+  hQueued.release();
+});
+
+test('a parent window flip reclaims an admitted single\'s borrowed lend without breaking the handle', async () => {
+  const root = createGate({ limit: 5, windowMs: 1000 });
+  const p = createGate({ limit: 2, windowMs: 40, parent: root });
+  const a = createGate({ limit: 2, windowMs: 1000, parent: p });
+  const h = await a.acquire(4); // own 2, parent lend 2
+  assert.equal(a.stats().inFlight, 4);
+  assert.equal(p.stats().inFlight, 2);
+  await sleep(80); // the parent window flips twice: the lend is reclaimed
+  assert.equal(p.stats().inFlight, 0);
+  assert.equal(a.stats().inFlight, 2); // the own part survives
+  h.release(); // still a valid handle; no double subtract
+  assert.equal(a.stats().inFlight, 0);
+});
+
+test('expiry and cancellation of a queued over-limit single release every reservation', async () => {
+  const root = createGate({ limit: 3, windowMs: 1000, maxWaitMs: 5000 });
+  const p = createGate({ limit: 3, windowMs: 1000, maxWaitMs: 5000, parent: root });
+  const a = createGate({ limit: 2, windowMs: 1000, maxWaitMs: 5000, parent: p });
+  await root.acquire(2);
+  await p.acquire(1); // pool full; p own 1/3
+  a.updateMaxWaitMs(20);
+  await assert.rejects(a.acquire(4), (err) => {
+    assert.equal(err.code, 'WAIT_EXPIRED');
+    return true;
+  });
+  assert.equal(a.stats().expired, 1);
+  assert.equal(a.stats().reserved, 0);
+  assert.equal(p.stats().reserved, 0);
+  assert.equal(root.stats().reserved, 0);
+  assert.equal(a.stats().waiting, 0);
+
+  a.updateMaxWaitMs(5000);
+  const ac = new AbortController();
+  const pCancel = a.acquire(4, ac.signal);
+  ac.abort();
+  await assert.rejects(pCancel, (err) => {
+    assert.equal(err.code, 'CANCELLED');
+    return true;
+  });
+  assert.equal(a.stats().cancelled, 1);
+  assert.equal(a.stats().reserved, 0);
+  assert.equal(p.stats().reserved, 0);
+  assert.equal(root.stats().reserved, 0);
+});
+
+test('a pre-aborted over-limit single settles CANCELLED without reserving or queueing', async () => {
+  const root = createGate({ limit: 3, windowMs: 1000, maxWaitMs: 5000 });
+  const child = createGate({ limit: 2, windowMs: 1000, maxWaitMs: 5000, parent: root });
+  await root.acquire(3); // pool full
+  const ac = new AbortController();
+  ac.abort();
+  await assert.rejects(child.acquire(3, ac.signal), (err) => {
+    assert.equal(err.code, 'CANCELLED');
+    return true;
+  });
+  assert.equal(child.stats().cancelled, 1);
+  assert.equal(child.stats().waiting, 0);
+  assert.equal(child.stats().reserved, 0);
+  assert.equal(root.stats().reserved, 0);
+});
+
+test('a pool limit shrink refuses an oversized queued single as a whole', async () => {
+  const root = createGate({ limit: 5, windowMs: 1000, maxWaitMs: 5000 });
+  const child = createGate({ limit: 2, windowMs: 1000, maxWaitMs: 5000, parent: root });
+  await root.acquire(5);
+  const p = child.acquire(4); // own 2 + 2 borrowed: needs 4 pool units
+  root.updateLimit(3); // 4 > 3: can never fit, refused on the spot
+  await assert.rejects(p, (err) => {
+    assert.equal(err.code, 'QUOTA_EXCEEDED');
+    return true;
+  });
+  assert.equal(child.stats().refused, 1);
+  assert.equal(child.stats().waiting, 0);
+  assert.equal(child.stats().reserved, 0);
+});
+
+test('a long queue settles correctly and a single gather stays independent of queue length', async () => {
+  const root = createGate({ limit: 1, windowMs: 20, maxWaitMs: 5000 });
+  const child = createGate({ limit: 1, windowMs: 20, maxWaitMs: 5000, parent: root });
+  await root.acquire(1); // pool full
+  const N = 80;
+  const promises = [];
+  for (let i = 0; i < N; i += 1) {
+    promises.push(i % 2 === 0 ? root.acquire(1) : child.acquire(1));
+  }
+  const handles = await Promise.all(promises);
+  assert.equal(root.stats().granted + child.stats().granted, N + 1);
+  for (const h of handles) h.release();
 });
