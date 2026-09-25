@@ -176,8 +176,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   // Pure plan: fills seg.own / seg.links and returns total pool need. A
   // member slice larger than that gate's own limit simply borrows the excess
   // up the chain — member limits never cap a combo, only the root pool does.
-  function planGather(segs) {
-    const r = state.root;
+  function planGather(r, segs) {
     const claimed = new Map();
     let poolNeed = 0;
     for (const seg of segs) {
@@ -212,7 +211,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
 
   // Apply a planned reservation; the caller pre-checked poolNeed against room.
   function applyGather(entry, segs) {
-    const r = entry.owner.root;
+    const r = entry.qroot;
     const gen = r.poolGen;
     for (const seg of segs) {
       const m = seg.gate;
@@ -247,7 +246,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   // own/lender/pool partition only decides which own window each unit lands
   // on (and thus where its flip reclaims it).
   function tryGather(entry, segs) {
-    const r = entry.owner.root;
+    const r = entry.qroot;
     let total = 0;
     for (const seg of segs) total += seg.units;
     if (r.poolUsed + total > r.poolLimit) {
@@ -257,7 +256,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
       }
       return false;
     }
-    planGather(segs);
+    planGather(r, segs);
     applyGather(entry, segs);
     return true;
   }
@@ -275,7 +274,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   // reclaimed it (the link is marked released and its gen is stale).
   function releaseHolds(entry) {
     if (!entry.holdsHeld || entry.segs === null) return;
-    const r = entry.owner.root;
+    const r = entry.qroot;
     for (const seg of entry.segs) {
       const m = seg.gate;
       if (!seg.ownReleased && seg.own > 0) {
@@ -349,7 +348,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   // occupations. Pool room was charged at gather time, so poolUsed does not
   // move here.
   function commitCombo(entry) {
-    const r = entry.owner.root;
+    const r = entry.qroot;
     const records = [];
     const lenderCleanup = new Set();
     for (const seg0 of entry.segs) {
@@ -427,9 +426,9 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   // granted / refused / expired / cancelled moves as a result.
   function settleEntry(entry, outcome) {
     if (entry.removed) return;
-    const ownerRoot = entry.owner.root;
+    const qroot = entry.qroot;
     entry.removed = true;
-    ownerRoot.liveQueued -= 1;
+    qroot.liveQueued -= 1;
     clearTimeout(entry.timer);
     detachSignal(entry);
     for (const charge of entry.waitCharges) charge.gate.waiting -= charge.units;
@@ -472,10 +471,15 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   }
 
   // At the same moment expiry beats cancellation: an abort arriving once the
-  // deadline has already passed settles as WAIT_EXPIRED.
+  // deadline has already passed settles as WAIT_EXPIRED. The deadline belongs
+  // to the entry's queuing family, which may differ from this closure's family
+  // after a reparent migrated a combo whose owner gate stayed behind.
   function onEntryAbort(entry) {
     if (entry.removed) return;
-    if (entry.deadline <= now()) {
+    const r = entry.qroot;
+    const t = Date.now();
+    if (t > r.lastNow) r.lastNow = t;
+    if (entry.deadline <= r.lastNow) {
       settleEntry(entry, 'expired');
     } else {
       settleEntry(entry, 'cancelled');
@@ -909,6 +913,10 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
           entry.yields = 0;
           entry.blockG = -1;
         }
+        // Old-family holds were already released against the old root; from
+        // here the entry queues and re-gathers against the joined pool, even
+        // when its entry-point owner gate stayed behind.
+        entry.qroot = newRootState;
         movedEntries.push(entry);
         movedLive += 1;
       } else {
@@ -997,11 +1005,22 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
           if (moved.has(entry.owner)) movedSingles.push(entry);
           continue;
         }
+        // Migration follows the members, which carry the combo's capacity.
+        //   - every member moves          -> the combo joins the new family
+        //   - no member moves, owner stays -> it stays put
+        //   - anything else (members split, or the entry-point owner moves
+        //     while all members remain) is a combination split across the two
+        //     families and is refused as a whole.
+        const ownerMoved = moved.has(entry.owner);
         let inMoved = 0;
         for (const g of entry.comboGates) if (moved.has(g)) inMoved += 1;
-        if (inMoved > 0 && inMoved < entry.comboGates.length) straddlers.push(entry);
-        else if (inMoved === entry.comboGates.length) whollyMoved.push(entry);
-        else stayingCombos.push(entry);
+        if (inMoved === entry.comboGates.length) {
+          whollyMoved.push(entry);
+        } else if (inMoved === 0 && !ownerMoved) {
+          stayingCombos.push(entry);
+        } else {
+          straddlers.push(entry);
+        }
       }
 
       // Capacity is decided before anything settles, so a rejected move rolls
@@ -1086,6 +1105,11 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     const t = now();
     const entry = {
       owner,
+      // Family whose queue and pool currently hold this entry. Capacity follows
+      // the member gates, so after a reparent migrates a combo whose entry-point
+      // gate stays behind, this can differ from owner.root; pool accounting and
+      // liveQueued always resolve through qroot, never owner.root directly.
+      qroot: owner.root,
       combo,
       units,
       resolve,
