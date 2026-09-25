@@ -1276,3 +1276,143 @@ test('reparent refuses a combo split across the two families and moves a whole c
   assert.equal(newRoot.stats().granted + oldRoot.stats().granted, oldGranted + 1);
   h.release();
 });
+
+// --- Immediate re-serving after a head settles (long window, no flip) -------
+
+test('cancelling a blocked head lets a held later request settle without a flip', async () => {
+  const gate = createGate({ limit: 2, windowMs: 10000, maxWaitMs: 5000 });
+  await gate.acquire(1); // pool 1/2
+  const ac = new AbortController();
+  const pHead = gate.acquire(2, ac.signal); // 1+2>2: blocked head, holds nothing
+  let laterSettled = false;
+  const pLater = gate.acquire(1).then((h) => {
+    laterSettled = true;
+    return h;
+  }); // 1+1=2: gathers the last unit and waits behind the head
+  assert.equal(gate.stats().waiting, 3);
+  ac.abort(); // head withdrawn: expiry/cancel/serve ordering, serve runs at once
+  const hLater = await pLater;
+  assert.equal(laterSettled, true); // settled on the same cut, no window flip
+  assert.equal(gate.stats().cancelled, 1);
+  assert.equal(gate.stats().granted, 2);
+  assert.equal(gate.stats().waiting, 0);
+  await assert.rejects(pHead, (err) => err.code === 'CANCELLED');
+  hLater.release();
+});
+
+test('a head expiring lets a held later request settle before any window flip', async () => {
+  const root = createGate({ limit: 2, windowMs: 10000, maxWaitMs: 5000 });
+  const child = createGate({ limit: 2, windowMs: 10000, maxWaitMs: 30, parent: root });
+  await root.acquire(1); // pool 1/2
+  const pHead = child.acquire(2); // short cap; cannot gather, expires at ~30ms
+  let laterSettled = false;
+  const pLater = root.acquire(1).then((h) => {
+    laterSettled = true;
+    return h;
+  }); // gathers the last unit, waits behind
+  assert.equal(root.stats().waiting, 1);
+  assert.equal(child.stats().waiting, 2);
+  const hLater = await pLater; // granted on the expiry cut, not at a (far-off) flip
+  assert.equal(laterSettled, true);
+  assert.equal(child.stats().expired, 1);
+  assert.equal(root.stats().granted, 2);
+  assert.equal(root.stats().inFlight, 2); // long window never flipped
+  await assert.rejects(pHead, (err) => err.code === 'WAIT_EXPIRED');
+  hLater.release();
+});
+
+test('expiry, cancellation and a grant on the same cut settle in that order', async (t) => {
+  const root = createGate({ limit: 3, windowMs: 10000, maxWaitMs: 50000 });
+  const soon = createGate({ limit: 3, windowMs: 10000, maxWaitMs: 30, parent: root });
+  await root.acquire(1); // pool 1/3
+  const ac = new AbortController();
+  const pHead = soon.acquire(3); // 1+3>3: blocked head, holds nothing, deadline t0+30
+  const pHeld = root.acquire(1); // 1+1=2 gathers and waits behind the head
+  const pAborted = root.acquire(1, ac.signal); // 2+1=3 gathers; later aborted
+  let served = false;
+  const pServed = root.acquire(1).then((h) => {
+    served = true;
+    return h;
+  }); // pool full; blocked behind the others
+  const realNow = Date.now();
+  t.mock.method(Date, 'now', () => realNow + 100); // only the head is due
+  ac.abort(); // one cut: the due head expires first, pAborted cancels second
+  await Promise.allSettled([pHead, pAborted]);
+  assert.equal(soon.stats().expired, 1);
+  assert.equal(root.stats().cancelled, 1);
+  const hHeld = await pHeld; // serve pass runs after both settlements
+  const hServed = await pServed; // the cancel freed its held unit for this one
+  assert.equal(served, true);
+  assert.equal(root.stats().granted, 3); // the original occupant plus two waiters
+  assert.equal(root.stats().inFlight, 3); // the long window never flipped
+  await assert.rejects(pHead, (err) => err.code === 'WAIT_EXPIRED');
+  await assert.rejects(pAborted, (err) => err.code === 'CANCELLED');
+  hHeld.release();
+  hServed.release();
+});
+
+// --- Queue-root attribution when the entry gate and the members split -------
+
+test('a migrated combo is counted on its entry gate but draws the joined pool', async () => {
+  const oldRoot = createGate({ limit: 2, windowMs: 10000, maxWaitMs: 5000 });
+  const a = createGate({ limit: 1, windowMs: 10000, maxWaitMs: 5000, parent: oldRoot });
+  const newRoot = createGate({ limit: 2, windowMs: 60, maxWaitMs: 0 });
+  await oldRoot.acquire(2); // old pool full
+  // Entered through oldRoot (which stays in the old family), but its only
+  // member a will move with the subtree.
+  const pCombo = oldRoot.acquireAll([{ gate: a, units: 1 }]);
+  assert.equal(oldRoot.stats().waiting, 0); // combo waiting is carried by the member
+  assert.equal(a.stats().waiting, 1);
+  a.reparent(newRoot);
+  assert.equal(a.stats().waiting, 1); // still queued, attribution stays with the entry/member gates
+  const h = await pCombo; // granted in the JOINED family at its window flip
+  assert.equal(a.stats().inFlight, 1); // occupation lives in the new family
+  assert.equal(oldRoot.stats().granted, 2); // counted on the entry gate: 1 admitted + 1 combo
+  assert.equal(newRoot.stats().granted, 0); // nothing entered through the new root
+  // The joined pool really covers it: one unit left of the pool cap of two.
+  const h2 = await newRoot.acquire(1);
+  await assert.rejects(newRoot.acquire(1), (err) => err.code === 'QUOTA_EXCEEDED');
+  assert.equal(oldRoot.stats().waiting, 0);
+  assert.equal(a.stats().waiting, 0);
+  h.release();
+  h2.release();
+});
+
+test('a migrated combo settles against the joined family even when its entry gate stays', async () => {
+  const oldRoot = createGate({ limit: 2, windowMs: 10000, maxWaitMs: 5000 });
+  const a = createGate({ limit: 1, windowMs: 10000, maxWaitMs: 5000, parent: oldRoot });
+  const newRoot = createGate({ limit: 2, windowMs: 10000, maxWaitMs: 30 });
+  await oldRoot.acquire(2);
+  const ac = new AbortController();
+  const pCombo = oldRoot.acquireAll([{ gate: a, units: 1 }], ac.signal);
+  a.reparent(newRoot); // entry migrates; its entry gate oldRoot stays behind
+  ac.abort(); // cancellation routes to the queue that actually owns the entry
+  await assert.rejects(pCombo, (err) => err.code === 'CANCELLED');
+  assert.equal(oldRoot.stats().cancelled, 1); // counted on the entry gate
+  assert.equal(a.stats().reserved, 0); // no reservation leaks in either family
+  assert.equal(newRoot.stats().reserved, 0);
+});
+
+test('withdrawing a blocked combo head settles held later requests without a flip', async () => {
+  const root = createGate({ limit: 4, windowMs: 10000, maxWaitMs: 5000 });
+  const a = createGate({ limit: 4, windowMs: 10000, maxWaitMs: 5000, parent: root });
+  const b = createGate({ limit: 4, windowMs: 10000, maxWaitMs: 5000, parent: root });
+  await root.acquire(2); // pool 2/4
+  const ac = new AbortController();
+  const pHead = root.acquireAll([{ gate: a, units: 4 }], ac.signal); // 2+4>4: blocked head
+  let laterSettled = false;
+  const pLater = b.acquireAll([{ gate: b, units: 2 }]).then((h) => {
+    laterSettled = true;
+    return h;
+  }); // 2+2=4 gathers whole and waits behind the blocked head
+  assert.equal(b.stats().reserved, 2);
+  ac.abort(); // head withdrawn: the held later combo is committed on this cut
+  const hLater = await pLater;
+  assert.equal(laterSettled, true); // no window flip involved
+  assert.equal(root.stats().cancelled, 1);
+  assert.equal(b.stats().granted, 1); // counted on the gate it entered through
+  assert.equal(b.stats().inFlight, 2);
+  assert.equal(b.stats().reserved, 0);
+  await assert.rejects(pHead, (err) => err.code === 'CANCELLED');
+  hLater.release();
+});

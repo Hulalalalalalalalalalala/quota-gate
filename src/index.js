@@ -96,6 +96,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     expired: 0,
     cancelled: 0,
     openHandles: new Set(),
+    ownedEntries: new Set(), // live queued entries that entered through this gate
     root: null,
     timer: null,
   };
@@ -130,11 +131,14 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   // Operational helpers read state.root dynamically rather than capturing the
   // local `root`: reparent() can move this gate (and its descendants) into
   // another family's pool.
-  function now() {
-    const r = state.root;
+  function rootNow(r) {
     const t = Date.now();
     if (t > r.lastNow) r.lastNow = t;
     return r.lastNow;
+  }
+
+  function now() {
+    return rootNow(state.root);
   }
 
   function effectiveDraw(node) {
@@ -183,8 +187,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   // Pure plan: fills seg.own / seg.links and returns total pool need. A
   // member slice larger than that gate's own limit simply borrows the excess
   // up the chain — member limits never cap a combo, only the root pool does.
-  function planGather(segs) {
-    const r = state.root;
+  function planGather(segs, r) {
     const claimed = new Map();
     let poolNeed = 0;
     for (const seg of segs) {
@@ -219,7 +222,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
 
   // Apply a planned reservation; the caller pre-checked poolNeed against room.
   function applyGather(entry, segs) {
-    const r = entry.owner.root;
+    const r = entry.qroot;
     const gen = r.poolGen;
     for (const seg of segs) {
       const m = seg.gate;
@@ -254,7 +257,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   // own/lender/pool partition only decides which own window each unit lands
   // on (and thus where its flip reclaims it).
   function tryGather(entry, segs) {
-    const r = entry.owner.root;
+    const r = entry.qroot;
     let total = 0;
     for (const seg of segs) total += seg.units;
     if (r.poolUsed + total > r.poolLimit) {
@@ -264,7 +267,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
       }
       return false;
     }
-    planGather(segs);
+    planGather(segs, r);
     applyGather(entry, segs);
     return true;
   }
@@ -282,7 +285,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   // reclaimed it (the link is marked released and its gen is stale).
   function releaseHolds(entry) {
     if (!entry.holdsHeld || entry.segs === null) return;
-    const r = entry.owner.root;
+    const r = entry.qroot;
     for (const seg of entry.segs) {
       const m = seg.gate;
       if (!seg.ownReleased && seg.own > 0) {
@@ -356,7 +359,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   // occupations. Pool room was charged at gather time, so poolUsed does not
   // move here.
   function commitCombo(entry) {
-    const r = entry.owner.root;
+    const r = entry.qroot;
     const records = [];
     const lenderCleanup = new Set();
     for (const seg0 of entry.segs) {
@@ -434,9 +437,10 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   // granted / refused / expired / cancelled moves as a result.
   function settleEntry(entry, outcome) {
     if (entry.removed) return;
-    const ownerRoot = entry.owner.root;
+    const ownerRoot = entry.qroot;
     entry.removed = true;
     ownerRoot.liveQueued -= 1;
+    entry.owner.ownedEntries.delete(entry);
     clearTimeout(entry.timer);
     detachSignal(entry);
     for (const charge of entry.waitCharges) charge.gate.waiting -= charge.units;
@@ -481,24 +485,30 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
         armEntry(entry, remaining);
         return;
       }
+      // Expiry is settled first; the following serve pass lets entries freed
+      // by this expiry (or by other due expiries in the same cut) settle in
+      // arrival order without waiting for the next window flip.
+      const r = entry.qroot;
       settleEntry(entry, 'expired');
+      serveRoot(r);
     }, chunk);
     if (typeof entry.timer.unref === 'function') entry.timer.unref();
   }
 
-  // At the same moment expiry beats cancellation: an abort arriving once the
-  // deadline has already passed settles as WAIT_EXPIRED.
+  // At the same moment expiry beats cancellation. On an abort the whole cut
+  // follows the fixed order expiry, then cancellation, then the serve pass:
+  // every other due expiry lands first, the aborting entry is withdrawn
+  // second, and later entries are retried last so a withdrawn head never
+  // leaves the queue parked until the next window flip.
   function onEntryAbort(entry) {
     if (entry.removed) return;
-    if (entry.deadline <= now()) {
-      settleEntry(entry, 'expired');
-    } else {
-      settleEntry(entry, 'cancelled');
-    }
+    const r = entry.qroot;
+    sweepExpiredAt(r, rootNow(r));
+    if (!entry.removed) settleEntry(entry, 'cancelled');
+    allocate(r);
   }
 
-  function recomputeMinDeadline() {
-    const r = state.root;
+  function recomputeMinDeadline(r = state.root) {
     let min = Infinity;
     const q = r.queue;
     for (let i = r.head; i < q.length; i += 1) {
@@ -509,9 +519,8 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   }
 
   // Expiry is judged before quota allocation: anything due at or before the
-  // flip moment expires rather than being granted.
-  function sweepExpired(t) {
-    const r = state.root;
+  // given moment expires rather than being granted.
+  function sweepExpiredAt(r, t) {
     if (r.minDeadline > t) return;
     let min = Infinity;
     for (let i = r.head; i < r.queue.length; i += 1) {
@@ -523,6 +532,18 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     r.minDeadline = min;
   }
 
+  function sweepExpired(t) {
+    sweepExpiredAt(state.root, t);
+  }
+
+  // Every serve pass settles due expiries BEFORE quota: when expiry,
+  // cancellation and a grant fall on the same moment the order is expiry,
+  // then cancellation (the caller settles the abort), then the pass below.
+  function serveRoot(r) {
+    sweepExpiredAt(r, rootNow(r));
+    allocate(r);
+  }
+
   // Allocation walks arrivals in order against the freshly reset pool. A head
   // combo that cannot be gathered whole does not starve later arrivals: a
   // later request that fits outright passes it and the combo yields once;
@@ -531,8 +552,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   // a single monotonic counter (serveWave, bumped once per overtaking serve)
   // lets each blocked combo derive its yield count without being touched by
   // the requests that pass it.
-  function allocate() {
-    const r = state.root;
+  function allocate(r = state.root) {
     const q = r.queue;
     let wave = r.serveWave; // overtakes counted so far, monotonic across passes
     let stopWave = Infinity; // earliest wave at which a blocker hardens
@@ -795,27 +815,30 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     // Waiters already past the new deadline settle as expired on the spot;
     // nothing is granted early and no deadline moves backwards into life.
     state.maxWaitMs = newMaxWaitMs;
-    const t = now();
-    let changed = false;
-    const r = state.root;
-    const q = r.queue;
-    for (let i = r.head; i < q.length; i += 1) {
-      const entry = q[i];
-      if (entry.removed || entry.owner !== state) continue;
+    const touchedRoots = new Set();
+    const expiredRoots = new Set();
+    for (const entry of state.ownedEntries) {
+      if (entry.removed) continue;
+      const r = entry.qroot;
+      touchedRoots.add(r);
+      const t = rootNow(r);
       const newDeadline = entry.enqueuedAt + newMaxWaitMs;
       if (newDeadline <= t) {
         settleEntry(entry, 'expired');
-        changed = true;
+        expiredRoots.add(r);
         continue;
       }
       if (newDeadline !== entry.deadline) {
         entry.deadline = newDeadline;
         clearTimeout(entry.timer);
         armEntry(entry, newDeadline - t);
-        changed = true;
       }
     }
-    if (changed) recomputeMinDeadline();
+    for (const r of touchedRoots) recomputeMinDeadline(r);
+    // A spot expiry frees room: settle the rest of that cut (expiry first)
+    // and re-try later entries instead of parking until the next flip. A
+    // pure retime without an expiry grants nothing early.
+    for (const r of expiredRoots) serveRoot(r);
   }
 
   function collectSubtree(target) {
@@ -940,9 +963,14 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
           entry.yields = 0;
           entry.blockG = -1;
         }
+        // Bookkeeping follows the entry's queue family, which may differ from
+        // the entry gate's own family: a combo may enter through a gate that
+        // stays while every member moves with the subtree.
+        entry.qroot = newRootState;
         movedEntries.push(entry);
         movedLive += 1;
       } else {
+        entry.qroot = oldRootState;
         staying.push(entry);
       }
     }
@@ -1104,6 +1132,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
 
   function makeEntry({
     owner,
+    qroot,
     combo,
     units,
     resolve,
@@ -1117,6 +1146,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     const t = now();
     const entry = {
       owner,
+      qroot, // family whose queue and liveQueued own this entry; follows the entry across reparent migrations
       combo,
       units,
       resolve,
@@ -1147,6 +1177,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     }
     armEntry(entry, entry.owner.maxWaitMs);
     if (entry.deadline < r.minDeadline) r.minDeadline = entry.deadline;
+    entry.owner.ownedEntries.add(entry);
     r.queue.push(entry);
   }
 
@@ -1176,6 +1207,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     // reclaims it before allocation.
     const holder = makeEntry({
       owner: state,
+      qroot: r,
       combo: false,
       units,
       resolve: () => {},
@@ -1289,6 +1321,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     // pool flip reclaims it before allocation.
     const holder = makeEntry({
       owner: state,
+      qroot: r,
       combo: true,
       units: totalUnits,
       resolve: () => {},
