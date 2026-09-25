@@ -219,7 +219,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
 
   // Apply a planned reservation; the caller pre-checked poolNeed against room.
   function applyGather(entry, segs) {
-    const r = entry.owner.root;
+    const r = entry.queueRoot;
     const gen = r.poolGen;
     for (const seg of segs) {
       const m = seg.gate;
@@ -254,7 +254,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   // own/lender/pool partition only decides which own window each unit lands
   // on (and thus where its flip reclaims it).
   function tryGather(entry, segs) {
-    const r = entry.owner.root;
+    const r = entry.queueRoot;
     let total = 0;
     for (const seg of segs) total += seg.units;
     if (r.poolUsed + total > r.poolLimit) {
@@ -282,7 +282,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   // reclaimed it (the link is marked released and its gen is stale).
   function releaseHolds(entry) {
     if (!entry.holdsHeld || entry.segs === null) return;
-    const r = entry.owner.root;
+    const r = entry.queueRoot;
     for (const seg of entry.segs) {
       const m = seg.gate;
       if (!seg.ownReleased && seg.own > 0) {
@@ -356,7 +356,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   // occupations. Pool room was charged at gather time, so poolUsed does not
   // move here.
   function commitCombo(entry) {
-    const r = entry.owner.root;
+    const r = entry.queueRoot;
     const records = [];
     const lenderCleanup = new Set();
     for (const seg0 of entry.segs) {
@@ -434,7 +434,10 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   // granted / refused / expired / cancelled moves as a result.
   function settleEntry(entry, outcome) {
     if (entry.removed) return;
-    const ownerRoot = entry.owner.root;
+    // The queue the entry lives in is its queueRoot's, which may differ from
+    // the entry gate's current family: a combo that migrated with a reparented
+    // subtree keeps its original entry gate.
+    const ownerRoot = entry.queueRoot;
     entry.removed = true;
     ownerRoot.liveQueued -= 1;
     clearTimeout(entry.timer);
@@ -940,6 +943,9 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
           entry.yields = 0;
           entry.blockG = -1;
         }
+        // The entry now lives in the joined family's queue and gathers
+        // against its pool, even when the entry gate itself stayed behind.
+        entry.queueRoot = newRootState;
         movedEntries.push(entry);
         movedLive += 1;
       } else {
@@ -1117,6 +1123,10 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     const t = now();
     const entry = {
       owner,
+      // The family root whose queue and pool this entry currently belongs to.
+      // Usually owner.root; a combo migrated by reparent() keeps its entry
+      // gate but gathers, commits and settles against the joined family.
+      queueRoot: owner.root,
       combo,
       units,
       resolve,
