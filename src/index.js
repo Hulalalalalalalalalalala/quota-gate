@@ -117,6 +117,10 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
       serveWave: 0, // monotonic count of serves that overtook a blocked combo
       minDeadline: Infinity, // earliest live deadline, skips idle sweeps
       lastNow: 0, // monotonic clock: never moves backwards
+      serveQueued: false, // a coalesced retry pass is pending on this root
+      serveTimer: null, // timer backing the pending retry pass
+      servingSync: false, // a synchronous cut (pool flip) is allocating itself
+      enqSeq: 0, // bumped only on a real enqueue: invalidates probe memories
       members: new Set(),
     });
     state.members.add(state);
@@ -183,8 +187,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   // Pure plan: fills seg.own / seg.links and returns total pool need. A
   // member slice larger than that gate's own limit simply borrows the excess
   // up the chain — member limits never cap a combo, only the root pool does.
-  function planGather(segs) {
-    const r = state.root;
+  function planGather(segs, r) {
     const claimed = new Map();
     let poolNeed = 0;
     for (const seg of segs) {
@@ -219,7 +222,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
 
   // Apply a planned reservation; the caller pre-checked poolNeed against room.
   function applyGather(entry, segs) {
-    const r = entry.owner.root;
+    const r = entry.qroot;
     const gen = r.poolGen;
     for (const seg of segs) {
       const m = seg.gate;
@@ -254,7 +257,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   // own/lender/pool partition only decides which own window each unit lands
   // on (and thus where its flip reclaims it).
   function tryGather(entry, segs) {
-    const r = entry.owner.root;
+    const r = entry.qroot;
     let total = 0;
     for (const seg of segs) total += seg.units;
     if (r.poolUsed + total > r.poolLimit) {
@@ -264,7 +267,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
       }
       return false;
     }
-    planGather(segs);
+    planGather(segs, r);
     applyGather(entry, segs);
     return true;
   }
@@ -282,7 +285,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   // reclaimed it (the link is marked released and its gen is stale).
   function releaseHolds(entry) {
     if (!entry.holdsHeld || entry.segs === null) return;
-    const r = entry.owner.root;
+    const r = entry.qroot;
     for (const seg of entry.segs) {
       const m = seg.gate;
       if (!seg.ownReleased && seg.own > 0) {
@@ -356,7 +359,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   // occupations. Pool room was charged at gather time, so poolUsed does not
   // move here.
   function commitCombo(entry) {
-    const r = entry.owner.root;
+    const r = entry.qroot;
     const records = [];
     const lenderCleanup = new Set();
     for (const seg0 of entry.segs) {
@@ -434,7 +437,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   // granted / refused / expired / cancelled moves as a result.
   function settleEntry(entry, outcome) {
     if (entry.removed) return;
-    const ownerRoot = entry.owner.root;
+    const ownerRoot = entry.qroot;
     entry.removed = true;
     ownerRoot.liveQueued -= 1;
     clearTimeout(entry.timer);
@@ -465,6 +468,11 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
         new QuotaExceededError('WAIT_EXPIRED', 'queued request expired before quota was available'),
       );
     }
+    // The head leaving (expiry, cancellation, whole refusal) must reopen the
+    // gate: try the survivors once this settlement cut finishes. The actual
+    // serve is a fresh timer phase away, so synchronous cuts never grant
+    // early and every same-moment expiry/cancellation lands first.
+    scheduleServe(ownerRoot);
   }
 
   // The wait timer measures real elapsed time, like the baseline. The
@@ -510,8 +518,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
 
   // Expiry is judged before quota allocation: anything due at or before the
   // flip moment expires rather than being granted.
-  function sweepExpired(t) {
-    const r = state.root;
+  function sweepExpired(r, t) {
     if (r.minDeadline > t) return;
     let min = Infinity;
     for (let i = r.head; i < r.queue.length; i += 1) {
@@ -523,17 +530,90 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     r.minDeadline = min;
   }
 
-  // Allocation walks arrivals in order against the freshly reset pool. A head
-  // combo that cannot be gathered whole does not starve later arrivals: a
-  // later request that fits outright passes it and the combo yields once;
-  // after yielding twice (cumulatively, across flips) it becomes a hard
-  // barrier like a non-fitting single. The pass is O(1) per live queue entry:
-  // a single monotonic counter (serveWave, bumped once per overtaking serve)
+  // A fired abort settles its entry synchronously inside abort() (the
+  // listener is attached before the request can be aborted), so a cut never
+  // needs a queue-wide cancel scan; the deadline check lives in the entry's
+  // own abort path. The serve pass still asks each entry it REACHES, in
+  // arrival order and before any gather, whether it is due or was aborted:
+  // expiry first, then cancellation, only then a grant. Entries beyond a
+  // barrier are not touched, keeping the pass constant per reached entry.
+  function settleDueAt(entry, t) {
+    if (entry.deadline <= t) {
+      settleEntry(entry, 'expired');
+      return true;
+    }
+    if (entry.signal !== null && entry.signal.aborted) {
+      settleEntry(entry, 'cancelled');
+      return true;
+    }
+    return false;
+  }
+
+  // One coalesced retry cut. Same-moment expiries/cancellations self-settle
+  // through their own timer/abort callbacks in the current timer phase before
+  // this zero-delay pass runs; the pass enforces the same order once more for
+  // every entry it reaches (covering a mocked clock jump).
+  function runRetryServe(r) {
+    const t = Date.now();
+    if (t > r.lastNow) r.lastNow = t;
+    if (r.liveQueued > 0) allocate(r, 'retry', t);
+  }
+
+  // A head entry that expires, is cancelled or refused wholesale must not
+  // freeze the queue: later entries get a fresh serve attempt once the
+  // settlement cut finishes. Serves never run inside another synchronous cut
+  // (adjustments never grant early).
+  //
+  // The retry is a fresh timer phase, not a microtask: several wait timers
+  // can fall due in one timer phase, and a microtask scheduled by the first
+  // would run between their callbacks, serving a later entry a beat before a
+  // same-moment expiry lands. A zero-delay timer only fires once the whole
+  // current phase drained, so expiry and cancellation callbacks that share
+  // the moment all settle first; the sweep at the start of the retry then
+  // enforces expiry, cancellation, allocation within that cut as well.
+  function scheduleServe(r) {
+    if (r.serveQueued || r.servingSync || r.liveQueued === 0) return;
+    r.serveQueued = true;
+    const timer = setTimeout(() => {
+      // Held up until the run ends: settlements made inside the retry
+      // coalesce into this run, which already walks to a fixed point.
+      r.serveTimer = null;
+      runRetryServe(r);
+      r.serveQueued = false;
+    }, 0);
+    r.serveTimer = timer;
+    if (typeof timer.unref === 'function') timer.unref();
+  }
+
+  // Drop a retry pass already queued but not yet run: an about-to-run cut
+  // covers everything the retry would.
+  function cancelPendingServe(r) {
+    if (!r.serveQueued) return;
+    if (r.serveTimer !== null) clearTimeout(r.serveTimer);
+    r.serveTimer = null;
+    r.serveQueued = false;
+  }
+
+  // Allocation walks arrivals in order against the current pool. A head combo
+  // that cannot be gathered whole does not starve later arrivals: a later
+  // request that fits outright passes it and the combo yields once; after
+  // yielding twice (cumulatively, across every serve opportunity) it hardens
+  // into an ordinary barrier like a non-fitting single; while it is a barrier
+  // later singles and combos both queue until a flip or another release
+  // condition (head cancellation/refusal, a lender flip freeing room, a
+  // reparent) re-opens the cut. The pass is O(1) per live queue entry: a
+  // single monotonic counter (serveWave, bumped once per overtaking serve)
   // lets each blocked combo derive its yield count without being touched by
   // the requests that pass it.
-  function allocate() {
-    const r = state.root;
+  //
+  // mode 'flip' is the pool-window-flip cut, where a blocked combo's failed
+  // gather moves rolledBack once. A 'retry' pass serves the same fairness
+  // rules after an entry settled away or an off-pool condition freed room,
+  // but never counts another rollback — the whole combo re-tries, it does not
+  // roll back again.
+  function allocate(r, mode, nowT) {
     const q = r.queue;
+    const t = nowT ?? (mode === 'flip' ? r.lastNow : Date.now());
     let wave = r.serveWave; // overtakes counted so far, monotonic across passes
     let stopWave = Infinity; // earliest wave at which a blocker hardens
     let blockerCount = 0; // blocked combos registered earlier in this/prev passes
@@ -541,6 +621,10 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
       const entry = q[i];
       if (entry.removed) continue;
       if (wave >= stopWave) break;
+      // Order within this cut for every entry reached: expiry, cancellation,
+      // then the gather. A settled entry yields its slot without counting an
+      // overtake (it did not pass a live blocker).
+      if (settleDueAt(entry, t)) continue;
       let served = false;
       if (!entry.combo) {
         // The pool flip (or a member/ancestor flip) may have reclaimed part
@@ -556,17 +640,37 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
           break;
         }
       } else {
-        // Combo's turn against the fresh pool: the pool flip reclaimed its
-        // pool side; release the surviving own-side holds and gather anew.
+        // Combo's turn against the current pool: a flip (or a lender window
+        // flip) reclaimed the held side; release the surviving holds and
+        // gather anew.
         if (entry.holdsHeld) releaseHolds(entry);
         const segs = buildSegs(entry.comboGates, (g) => entry.comboUnits.get(g));
         if (tryGather(entry, segs)) {
           settleEntry(entry, 'granted');
           served = true;
         } else {
-          // Any step short: the plan touched nothing; count one whole
-          // rollback (no other counter moves) and register a soft barrier.
-          entry.owner.rolledBack += 1;
+          // Any step short: the plan touched nothing. On the pool-flip cut
+          // count one whole rollback (no other counter moves); off-flip
+          // retries just register/refresh the soft barrier for free.
+          //
+          // If this combo was already probed against the same pool charge in
+          // the same pool window without an intervening overtake, nothing it
+          // waits on changed since: stop the pass here (constant amortized),
+          // the entries beyond it would all re-probe the same way.
+          if (
+            mode === 'retry' &&
+            entry.probeGen === r.poolGen &&
+            entry.probePool === r.poolUsed &&
+            entry.probeWave === wave &&
+            entry.probeSeq === r.enqSeq
+          ) {
+            break;
+          }
+          entry.probeGen = r.poolGen;
+          entry.probePool = r.poolUsed;
+          entry.probeWave = wave;
+          entry.probeSeq = r.enqSeq;
+          if (mode === 'flip') entry.owner.rolledBack += 1;
           if (entry.blockG !== -1) entry.yields += wave - entry.blockG;
           entry.blockG = wave;
           const hardensAt = wave + (2 - entry.yields);
@@ -593,6 +697,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   function flipOwn(target) {
     now();
     const r = target.root;
+    const poolBefore = r.poolUsed;
 
     // 1a) Uncommitted member-own promises on the flipping gate.
     for (const entry of target.resvAsMember) {
@@ -647,48 +752,72 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     target.lentInFlight = 0;
     target.pendingOwn = 0;
     target.pendingLends = 0;
+
+    // A serve can newly succeed only if this flip returned pool units charged
+    // in the current pool window (uncommitted promises first, then admitted
+    // lends from this gate): feasibility is purely pool room. The gate's own
+    // window quota only decides where each unit is booked, so a flip that
+    // leaves poolUsed unchanged never unblocks the queue and must not scan it.
+    if (r.poolUsed !== poolBefore) scheduleServe(r);
   }
 
   function flipRoot() {
     const t = now();
     const r = state;
 
-    // Expiry is judged before anything is reclaimed or granted.
-    sweepExpired(t);
+    // A retry already armed for the next phase is fully covered by this flip
+    // cut (same expiry/cancel sweep, then an allocation against a fresh pool).
+    cancelPendingServe(r);
 
-    // 1) Reclaim uncommitted reservation borrows from the pool FIRST, before
-    //    admitted occupations' pool borrows. The combos stay queued and gather
-    //    again at their turn below; non-root own slices survive their windows.
-    for (const link of r.poolResv) link.released = true;
-    r.poolResv.clear();
-    r.poolResvUnits = 0;
-    r.resvAsMember.clear();
+    // This whole flip is one synchronous cut and ends in an allocation pass
+    // that already walks the queue under the same fairness rules a retry
+    // would use; settlements inside it therefore must not arm a redundant
+    // retry timer.
+    r.servingSync = true;
+    try {
+      // Due entries expire before pool room is reclaimed or anything is
+      // granted (baseline order). Cancellation needs no sweep: a fired abort
+      // already settled its entry through its listener, and the serve pass
+      // below re-checks every entry it reaches anyway.
+      sweepExpired(r, t);
 
-    // 2) Reclaim admitted pool borrows. Handles stay valid; the inFlight drop
-    //    is visible in this same snapshot.
-    for (const link of r.poolLinks) {
-      if (link.mgen === link.member.ownGen) {
-        link.member.inFlight -= link.units;
-        link.member.borrowedInFlight -= link.units;
+      // 1) Reclaim uncommitted reservation borrows from the pool FIRST, before
+      //    admitted occupations' pool borrows. The combos stay queued and
+      //    gather again at their turn below; non-root own slices survive their
+      //    windows.
+      for (const link of r.poolResv) link.released = true;
+      r.poolResv.clear();
+      r.poolResvUnits = 0;
+      r.resvAsMember.clear();
+
+      // 2) Reclaim admitted pool borrows. Handles stay valid; the inFlight
+      //    drop is visible in this same snapshot.
+      for (const link of r.poolLinks) {
+        if (link.mgen === link.member.ownGen) {
+          link.member.inFlight -= link.units;
+          link.member.borrowedInFlight -= link.units;
+        }
       }
+      r.poolLinks.clear();
+
+      // 3) The root's own occupations end with its own window.
+      r.openHandles.clear();
+      r.ownGen += 1;
+      r.usedOwn = 0;
+      r.inFlight = 0;
+      r.borrowedInFlight = 0;
+      r.lentInFlight = 0;
+
+      // The pool window resets. Committed poolDraw is generation-tagged, so
+      // no family-wide sweep is needed.
+      r.poolGen += 1;
+      r.poolUsed = 0;
+
+      // 4) Serve the queue in arrival order, re-gathering combos as they come.
+      allocate(r, 'flip', t);
+    } finally {
+      r.servingSync = false;
     }
-    r.poolLinks.clear();
-
-    // 3) The root's own occupations end with its own window.
-    r.openHandles.clear();
-    r.ownGen += 1;
-    r.usedOwn = 0;
-    r.inFlight = 0;
-    r.borrowedInFlight = 0;
-    r.lentInFlight = 0;
-
-    // The pool window resets. Committed poolDraw is generation-tagged, so no
-    // family-wide sweep is needed.
-    r.poolGen += 1;
-    r.poolUsed = 0;
-
-    // 4) Serve the queue in arrival order, re-gathering combos as they come.
-    allocate();
   }
 
   function onWindowFire() {
@@ -760,7 +889,12 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
         touched = true;
       }
     }
-    if (touched) recomputeMinDeadline();
+    if (touched) {
+      recomputeMinDeadline();
+      // The refused entries leave a hole at the head: survivors get a fresh
+      // attempt after the cut instead of waiting for a flip they may not need.
+      scheduleServe(r);
+    }
   }
 
   function updateLimit(newLimit) {
@@ -939,7 +1073,11 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
           // the combo starts yielding fresh in the joined family.
           entry.yields = 0;
           entry.blockG = -1;
+          entry.probeGen = -1;
+          entry.probePool = -1;
+          entry.probeWave = -1;
         }
+        entry.qroot = newRootState;
         movedEntries.push(entry);
         movedLive += 1;
       } else {
@@ -1090,6 +1228,12 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
       if (oldRootState.lastNow > newRootState.lastNow) {
         newRootState.lastNow = oldRootState.lastNow;
       }
+      // The cut itself grants nothing; once it finishes, both families
+      // re-attempt their queues — refused straddlers must not block stayers,
+      // and wholly migrated combos gather anew in the joined family and commit
+      // the moment the new pool covers them.
+      scheduleServe(oldRootState);
+      scheduleServe(newRootState);
     } else {
       // Same family: only the direct link moves; the shared pool is
       // untouched, so the old direct parent sees no cut at all. Outstanding
@@ -1117,6 +1261,11 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     const t = now();
     const entry = {
       owner,
+      // Family whose pool/queue the entry currently gathers and settles in.
+      // Reparenting can move the entry (or its combo members) into another
+      // family while the entry-point owner stays behind; quota accounting
+      // then follows qroot while the grant/refusal counters follow owner.
+      qroot: owner.root,
       combo,
       units,
       resolve,
@@ -1131,6 +1280,16 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
       waitCharges,
       yields: 0, // total overtakes conceded while blocked
       blockG: -1, // serveWave at which this combo last registered as blocked
+      // Pool charge at which this combo's last failed gather was probed. A
+      // retry pass can stop at a combo probed before at the very same charge
+      // and serve wave: since then nothing it waits on moved (no reservation
+      // was released, no overtake happened, the combo did not settle), so the
+      // scan beyond it would repeat. This is what keeps serve-free retries
+      // constant amortized instead of re-scanning the queue.
+      probeGen: -1,
+      probePool: -1,
+      probeWave: -1,
+      probeSeq: 0, // family enqSeq at probe time; a later enqueue voids the memo
       holdsHeld: false,
       segs: null,
       comboGates: comboGates ?? null,
@@ -1148,6 +1307,9 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     armEntry(entry, entry.owner.maxWaitMs);
     if (entry.deadline < r.minDeadline) r.minDeadline = entry.deadline;
     r.queue.push(entry);
+    // A new arrival may fit past a previously blocked combo; void every probe
+    // memory taken in this pool window.
+    r.enqSeq += 1;
   }
 
   function acquire(units = 1, signal) {

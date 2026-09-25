@@ -1265,14 +1265,174 @@ test('reparent refuses a combo split across the two families and moves a whole c
   const oldRoot = createGate({ limit: 5, windowMs: 1000, maxWaitMs: 5000 });
   const a = createGate({ limit: 2, windowMs: 1000, maxWaitMs: 5000, parent: oldRoot });
   const b = createGate({ limit: 2, windowMs: 1000, maxWaitMs: 5000, parent: oldRoot });
-  const newRoot = createGate({ limit: 5, windowMs: 60, maxWaitMs: 5000 });
+  const newRoot = createGate({ limit: 5, windowMs: 1000, maxWaitMs: 5000 });
   await oldRoot.acquire(4);
   const pSplit = oldRoot.acquireAll([{ gate: a, units: 1 }, { gate: b, units: 1 }]);
   const pMoved = oldRoot.acquireAll([{ gate: a, units: 1 }]);
+  const oldGranted = oldRoot.stats().granted;
   a.reparent(newRoot);
   await assert.rejects(pSplit, (err) => err.code === 'QUOTA_EXCEEDED');
-  const oldGranted = oldRoot.stats().granted;
-  const h = await pMoved; // gathers anew and grants in the joined family
+  // The split combo left the queue, so the wholly moved combo behind it is not
+  // blocked: it releases its old-family reservation, gathers anew in the
+  // joined family and commits as an occupation without waiting for a flip.
+  const h = await pMoved;
+  assert.equal(a.stats().inFlight, 1); // the occupation lives in the new family
+  assert.equal(a.stats().waiting, 0);
+  // Grant attribution follows the entry-point gate (oldRoot), which stayed in
+  // the old family even though the member moved.
   assert.equal(newRoot.stats().granted + oldRoot.stats().granted, oldGranted + 1);
+  // The moved occupation charges the new pool: only four units remain there.
+  await newRoot.acquire(4);
+  const newProbe = createGate({ limit: 1, windowMs: 1000, maxWaitMs: 0, parent: newRoot });
+  await assert.rejects(newProbe.acquire(1), (err) => err.code === 'QUOTA_EXCEEDED');
+  // The old pool still carries its original 4; the moved combo left nothing
+  // behind there, so exactly one unit remains in the old family.
+  const hOld = await oldRoot.acquire(1);
+  const oldProbe = createGate({ limit: 1, windowMs: 1000, maxWaitMs: 0, parent: oldRoot });
+  await assert.rejects(oldProbe.acquire(1), (err) => err.code === 'QUOTA_EXCEEDED');
+  h.release();
+  hOld.release();
+});
+
+// --- Re-serving without a window flip (new fairness behavior) ---------------
+
+test('cancelling a blocked head re-serves later requests without a flip', async () => {
+  const gate = createGate({ limit: 5, windowMs: 10000, maxWaitMs: 5000 });
+  await gate.acquire(3); // pool 3/5
+  const ac = new AbortController();
+  const pHead = gate.acquire(4, ac.signal); // 3+4>5, blocked head
+  let laterSettled = false;
+  const pLater = gate.acquire(1).then((h) => { laterSettled = true; return h; }); // fits: 3+1
+  ac.abort();
+  await assert.rejects(pHead, (err) => err.code === 'CANCELLED');
+  // No flip happened (10s window): the head leaving re-opens the cut itself.
+  const h = await pLater;
+  assert.equal(laterSettled, true);
+  assert.equal(gate.stats().granted, 2); // the original 3-unit grant plus this one
+  assert.equal(gate.stats().cancelled, 1);
+  h.release();
+});
+
+test('a head expiring re-serves later requests without a flip', async () => {
+  const root = createGate({ limit: 4, windowMs: 10000, maxWaitMs: 5000 });
+  const laterGate = createGate({ limit: 4, windowMs: 10000, maxWaitMs: 5000, parent: root });
+  await root.acquire(3); // pool 3/4
+  const pHead = root.acquire(3); // 3+3>4, blocked head
+  root.updateMaxWaitMs(20); // the head is already late on the next timer phase
+  let laterSettled = false;
+  // A separate family gate keeps its own (long) wait cap, so only the head
+  // is due when the cut re-opens.
+  const pLater = laterGate.acquire(1).then((h) => { laterSettled = true; return h; });
+  await assert.rejects(pHead, (err) => err.code === 'WAIT_EXPIRED');
+  const h = await pLater; // flows immediately once the head expires, no flip
+  assert.equal(laterSettled, true);
+  assert.equal(root.stats().expired, 1);
+  h.release();
+});
+
+test('a shrink-refused queued combo leaves the queue and lets a later request flow', async () => {
+  const root = createGate({ limit: 5, windowMs: 10000, maxWaitMs: 5000 });
+  await root.acquire(3); // pool 3/5
+  const pBig = root.acquire(5); // queued; pool 5 wide, it waits for the flip
+  let smallSettled = false;
+  const pSmall = root.acquire(1).then((h) => { smallSettled = true; return h; });
+  root.updateLimit(4); // total 5 can never fit: refused wholesale and removed
+  await assert.rejects(pBig, (err) => err.code === 'QUOTA_EXCEEDED');
+  const h = await pSmall; // 3+1=4 fits; served in the same adjustment's wake, no flip
+  assert.equal(smallSettled, true);
+  assert.equal(root.stats().refused, 1);
+  assert.equal(root.stats().granted, 2);
+  h.release();
+});
+
+test('an off-flip retry overtakes a blocked combo without counting another rollback', async () => {
+  const root = createGate({ limit: 10, windowMs: 10000, maxWaitMs: 5000 });
+  await root.acquire(6); // pool 6/10
+  const ac1 = new AbortController();
+  // Head and middle are COMBOS (only combos yield); both total 5 and block at
+  // 6/10, while the later request totals 4 and fits outright.
+  const pX = root.acquireAll([{ gate: root, units: 5 }], ac1.signal);
+  const pA = root.acquireAll([{ gate: root, units: 5 }]); // also blocked, behind
+  let laterSettled = false;
+  const pLater = root.acquire(4).then((h) => { laterSettled = true; return h; }); // 6+4 fits
+  const rolledBefore = root.stats().rolledBack;
+  ac1.abort(); // the head leaves away from any flip
+  await assert.rejects(pX, (err) => err.code === 'CANCELLED');
+  const h = await pLater; // re-serve cut: it overtakes the still-blocked pA
+  assert.equal(laterSettled, true);
+  // The off-flip re-gather of the blocked pA was a retry, not a rollback.
+  assert.equal(root.stats().rolledBack, rolledBefore);
+  h.release();
+  pA.catch(() => {});
+});
+
+test('a lender window flip freeing pool room re-serves the queue without a pool flip', async () => {
+  const root = createGate({ limit: 10, windowMs: 10000, maxWaitMs: 5000 });
+  const p = createGate({ limit: 2, windowMs: 40, maxWaitMs: 5000, parent: root });
+  const a = createGate({ limit: 2, windowMs: 10000, maxWaitMs: 5000, parent: p });
+  await a.acquire(4); // own 2 plus 2 lent by p; pool 4/10
+  await root.acquire(5); // pool 9/10
+  let served = false;
+  const pWait = root.acquire(2).then((h) => { served = true; return h; }); // 9+2>10 waits
+  await new Promise((resolve) => setTimeout(resolve, 70)); // p flips; the root pool does not
+  // p's admitted lend of 2 is reclaimed: pool drops to 7, the waiter gathers at once.
+  const h = await pWait;
+  assert.equal(served, true);
+  assert.equal(root.stats().granted, 2); // the 5-unit grant and this one; a's grant is on a
+  h.release();
+});
+
+// --- Reparent queue fallout -------------------------------------------------
+
+test('a split combo refusal unblocks a staying waiter in the old family', async () => {
+  const oldRoot = createGate({ limit: 10, windowMs: 10000, maxWaitMs: 5000 });
+  const a = createGate({ limit: 2, windowMs: 10000, maxWaitMs: 5000, parent: oldRoot });
+  const b = createGate({ limit: 2, windowMs: 10000, maxWaitMs: 5000, parent: oldRoot });
+  const newRoot = createGate({ limit: 10, windowMs: 10000, maxWaitMs: 5000 });
+  await oldRoot.acquire(9); // pool 9/10: the 2-unit split combo cannot gather
+  const pSplit = oldRoot.acquireAll([{ gate: a, units: 1 }, { gate: b, units: 1 }]); // queues
+  let stayerSettled = false;
+  const pStayer = b.acquire(1).then((h) => { stayerSettled = true; return h; }); // 9+1 fits
+  a.reparent(newRoot); // the split combo is refused and exits the queue
+  await assert.rejects(pSplit, (err) => err.code === 'QUOTA_EXCEEDED');
+  const h = await pStayer; // flows immediately in the old family, no flip
+  assert.equal(stayerSettled, true);
+  assert.equal(b.stats().inFlight, 1);
+  assert.equal(b.stats().granted, 1); // the grant is booked on its entry-point gate
+  h.release();
+});
+
+test('a migrated single re-gathers in the joined family and commits without a flip', async () => {
+  const oldRoot = createGate({ limit: 1, windowMs: 10000, maxWaitMs: 5000 });
+  const child = createGate({ limit: 1, windowMs: 10000, maxWaitMs: 5000, parent: oldRoot });
+  const newRoot = createGate({ limit: 2, windowMs: 10000, maxWaitMs: 5000 });
+  await oldRoot.acquire(1); // old pool full
+  const p = child.acquire(1); // queued in the old family
+  child.reparent(newRoot); // free new pool; the single re-gathers and commits at once
+  const h = await p;
+  assert.equal(child.stats().inFlight, 1);
+  assert.equal(child.stats().waiting, 0);
+  assert.equal(child.stats().granted, 1); // bookkeeping follows the entry-point gate
+  assert.equal(newRoot.stats().granted, 0);
+  h.release();
+});
+
+test('a migrated combo keeps grant attribution on the entry-point gate family', async () => {
+  const oldRoot = createGate({ limit: 5, windowMs: 10000, maxWaitMs: 5000 });
+  const a = createGate({ limit: 2, windowMs: 10000, maxWaitMs: 5000, parent: oldRoot });
+  const newRoot = createGate({ limit: 5, windowMs: 10000, maxWaitMs: 5000 });
+  await oldRoot.acquire(4); // old pool 4/5: the combo queues
+  // Entry point is oldRoot even though its only member is the moving gate a.
+  const p = oldRoot.acquireAll([{ gate: a, units: 1 }]);
+  a.reparent(newRoot); // whole combo follows the member and regathers in the free pool
+  const h = await p; // commits without a flip
+  assert.equal(a.stats().inFlight, 1);
+  assert.equal(oldRoot.stats().granted, 2); // bookkeeping follows the entry gate...
+  assert.equal(newRoot.stats().granted, 0); // ...not the member's new family
+  assert.equal(newRoot.stats().inFlight, 0);
+  // Quota, by contrast, is charged in the joined family's pool.
+  await newRoot.acquire(4);
+  const probe = createGate({ limit: 1, windowMs: 10000, maxWaitMs: 0, parent: newRoot });
+  await assert.rejects(probe.acquire(1), (err) => err.code === 'QUOTA_EXCEEDED');
   h.release();
 });

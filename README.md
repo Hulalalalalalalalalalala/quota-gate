@@ -55,12 +55,20 @@ Combined and single requests share one arrival-ordered queue and settle
 independently. A head combo that cannot be gathered does not starve later
 arrivals: a later request (single or combined) that can be satisfied outright
 is let through, and the blocked combo yields once. After yielding twice it
-stops yielding and becomes an ordinary barrier. A waiting combo may be
-cancelled with its `AbortSignal` (`CANCELLED`); if its wait cap runs out it
-settles as `WAIT_EXPIRED`; both reject with `QuotaExceededError` and release
-the whole reservation. A signal already aborted settles immediately without
-entering the queue. With `maxWaitMs` 0 a combo that cannot commit on the spot
-is refused `QUOTA_EXCEEDED`.
+stops yielding and becomes an ordinary barrier. While it is a barrier later
+singles and combos keep queueing until a window flip or another release
+condition reopens the cut: a queued head expiring, being aborted, or being
+refused wholesale (for example by a limit shrink or a family-splitting
+reparent), or a lender window reclaiming borrowed pool units, immediately
+re-attempts the surviving entries without waiting for a pool flip. A queued
+combo may be cancelled with its `AbortSignal` (`CANCELLED`); if its wait cap
+runs out it settles as `WAIT_EXPIRED`; both reject with `QuotaExceededError`
+and release the whole reservation. When expiry, cancellation and a grant fall
+on the same moment they settle in that order — expiry first, then
+cancellation, only then the queue is served. A signal already aborted settles
+immediately without entering the queue. With `maxWaitMs` 0 a combo that
+cannot commit on the spot is refused `QUOTA_EXCEEDED`; it never queues and
+never yields.
 
 When an ancestor window turns, borrowed quota is reclaimed uncommitted
 reservations first (member own slice, then ancestor lends), then the parts
@@ -113,9 +121,14 @@ grants queued requests early and never tears apart admitted occupations.
   re-borrowed from the new family in one snapshot; if the new family's pool
   cannot cover it, the call throws `QuotaExceededError` (`QUOTA_EXCEEDED`)
   and nothing changes. A queued combination split across the two families by
-  the move is refused as a whole; a combination wholly inside the moved
+  the move is refused as a whole (`QUOTA_EXCEEDED`) and leaves the queue, so
+  it never blocks stayers that fit; a combination wholly inside the moved
   subtree releases its old-family reservation and gathers anew in the joined
-  family. Reparenting under the gate itself or one of its descendants, or
+  family, committing as soon as it gathers rather than waiting for a flip.
+  A queued entry's quota accounting follows the family it gathers in, while
+  its `granted`/`refused`/`expired`/`cancelled` cuts stay on the entry-point
+  gate even when that gate's family and the gathering family diverge.
+  Reparenting under the gate itself or one of its descendants, or
   with a limit above the new parent's, raises `RangeError`; a target that is
   not a gate from this module raises `TypeError`. Invalid calls produce no
   observable cut.
