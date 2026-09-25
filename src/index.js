@@ -15,6 +15,13 @@ const gateState = new WeakMap();
 // order so reparented queues can merge fairly.
 let enqueueSeq = 0;
 
+// setTimeout/setInterval clamp delays beyond the signed 32-bit range to 1ms,
+// which would expire a patient waiter — or flip a long window — almost
+// immediately. Long delays therefore fire in real-time chunks: each fire
+// consumes one chunk and re-arms the remainder, so the measured wait is real
+// elapsed time exactly like a single timer.
+const MAX_TIMER_DELAY = 0x7fffffff;
+
 function assertInteger(value, name) {
   if (typeof value !== 'number' || !Number.isInteger(value)) {
     throw new TypeError(`${name} must be an integer`);
@@ -462,12 +469,20 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
 
   // The wait timer measures real elapsed time, like the baseline. The
   // deadline field additionally gates window-flip sweeps when the monotonic
-  // clock and the wall clock disagree (mocked/frozen clocks).
+  // clock and the wall clock disagree (mocked/frozen clocks). Delays beyond
+  // the 32-bit timer range fire in chunks so the cap is honoured in full
+  // instead of overflowing to 1ms.
   function armEntry(entry, delay) {
+    const chunk = Math.min(Math.max(1, delay), MAX_TIMER_DELAY);
     entry.timer = setTimeout(() => {
       if (entry.removed) return;
+      const remaining = delay - chunk;
+      if (remaining > 0) {
+        armEntry(entry, remaining);
+        return;
+      }
       settleEntry(entry, 'expired');
-    }, Math.max(1, delay));
+    }, chunk);
     if (typeof entry.timer.unref === 'function') entry.timer.unref();
   }
 
@@ -681,8 +696,25 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     else flipOwn(state);
   }
 
-  state.timer = setInterval(onWindowFire, windowMs);
-  if (typeof state.timer.unref === 'function') state.timer.unref();
+  // The window flip really fires on the event loop, even when the window is
+  // longer than the 32-bit timer range: fire in real-time chunks and flip
+  // only once a full window has elapsed. The next window is armed before the
+  // flip runs, so the cadence survives anything the flip itself does.
+  function armWindow(delay) {
+    const chunk = Math.min(Math.max(1, delay), MAX_TIMER_DELAY);
+    state.timer = setTimeout(() => {
+      const remaining = delay - chunk;
+      if (remaining > 0) {
+        armWindow(remaining);
+        return;
+      }
+      armWindow(state.windowMs);
+      onWindowFire();
+    }, chunk);
+    if (typeof state.timer.unref === 'function') state.timer.unref();
+  }
+
+  armWindow(windowMs);
 
   // --- Runtime adjustments -------------------------------------------------
 
@@ -752,9 +784,8 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     // from this adjustment. Used quota is not cleared, queued deadlines do
     // not move, and no request is granted early.
     state.windowMs = newWindowMs;
-    clearInterval(state.timer);
-    state.timer = setInterval(onWindowFire, newWindowMs);
-    if (typeof state.timer.unref === 'function') state.timer.unref();
+    clearTimeout(state.timer);
+    armWindow(newWindowMs);
   }
 
   function updateMaxWaitMs(newMaxWaitMs) {

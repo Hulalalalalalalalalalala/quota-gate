@@ -911,6 +911,45 @@ test('an abort arriving once the deadline has passed settles as expired', async 
   assert.equal(gate.stats().cancelled, 0);
 });
 
+test('a wait cap beyond the 32-bit timer range still queues and grants at the flip', async () => {
+  const gate = createGate({ limit: 1, windowMs: 60, maxWaitMs: 3_000_000_000 });
+  await gate.acquire(1);
+  // The cap overflows a raw setTimeout to 1ms; the waiter must still wait for
+  // the window flip and settle as granted, not expire almost immediately.
+  const h = await gate.acquire(1);
+  assert.equal(gate.stats().granted, 2);
+  assert.equal(gate.stats().expired, 0);
+  assert.equal(gate.stats().waiting, 0);
+  h.release();
+});
+
+test('a window beyond the 32-bit timer range does not flip early', async () => {
+  const gate = createGate({ limit: 1, windowMs: 3_000_000_000 });
+  await gate.acquire(1);
+  await sleep(50); // an overflowed interval would have flipped many times by now
+  await assert.rejects(gate.acquire(1), (err) => {
+    assert.equal(err.code, 'QUOTA_EXCEEDED');
+    return true;
+  });
+  assert.equal(gate.stats().inFlight, 1); // the window is still open
+  assert.equal(gate.stats().refused, 1);
+});
+
+test('a long-capped waiter still settles on cancellation, not early expiry', async () => {
+  const gate = createGate({ limit: 1, windowMs: 3_000_000_000, maxWaitMs: 3_000_000_000 });
+  await gate.acquire(1);
+  const ac = new AbortController();
+  const p = gate.acquire(1, ac.signal);
+  await sleep(50); // past any overflowed 1ms wait timer
+  ac.abort();
+  await assert.rejects(p, (err) => {
+    assert.equal(err.code, 'CANCELLED');
+    return true;
+  });
+  assert.equal(gate.stats().cancelled, 1);
+  assert.equal(gate.stats().expired, 0);
+});
+
 test('the four terminal counters together account for every settled request', async () => {
   const g1 = createGate({ limit: 1, windowMs: 10000, maxWaitMs: 0 });
   await g1.acquire(); // granted
