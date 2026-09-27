@@ -157,6 +157,16 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     node.poolDraw += units;
   }
 
+  // Mirror a live pool-charge reduction on the member gate whose committed
+  // occupation carried those units. A lender's own-window flip reclaims a lent
+  // unit (r.poolUsed drops) WITHOUT flipping the pool generation, so the
+  // member's draw must shrink here too; otherwise the stale draw would both
+  // reject a migration whose live draw fits and over-deduct the old pool on a
+  // move that proceeds. A pool flip invalidates the draw wholesale via drawGen.
+  function reduceDraw(node, units, r) {
+    if (node.drawGen === r.poolGen) node.poolDraw -= units;
+  }
+
   function reservedOn(g) {
     return g === g.root ? g.root.poolResvUnits : g.pendingOwn + g.pendingLends;
   }
@@ -538,6 +548,12 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   // clock and the wall clock disagree (mocked/frozen clocks). Delays beyond
   // the 32-bit timer range fire in chunks so the cap is honoured in full
   // instead of overflowing to 1ms.
+  //
+  // The timer is deliberately NOT unref'd: a queued request must settle on
+  // real elapsed time even when nothing else keeps the event loop alive, so a
+  // process that only has a pending wait must not exit before the deadline.
+  // (The long-lived window timer stays unref'd so an idle gate without waiters
+  // does not pin the process.)
   function armEntry(entry, delay) {
     const chunk = Math.min(Math.max(1, delay), MAX_TIMER_DELAY);
     entry.timer = setTimeout(() => {
@@ -553,7 +569,6 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
       // behind it in the same event-loop tick.
       drainHeld(r);
     }, chunk);
-    if (typeof entry.timer.unref === 'function') entry.timer.unref();
   }
 
   // At the same moment expiry beats cancellation: an abort arriving once the
@@ -708,6 +723,8 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
       }
       if (link.lgen === target.ownGen && target !== r && link.pgen === r.poolGen) {
         r.poolUsed -= link.units;
+        // Keep the member's committed draw exact with the live pool charge.
+        reduceDraw(link.member, link.units, r);
       }
     }
     target.lentLinks.clear();
