@@ -130,11 +130,15 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   // Operational helpers read state.root dynamically rather than capturing the
   // local `root`: reparent() can move this gate (and its descendants) into
   // another family's pool.
-  function now() {
-    const r = state.root;
+  // Monotonic clock of one family root: never moves backwards.
+  function familyNow(r) {
     const t = Date.now();
     if (t > r.lastNow) r.lastNow = t;
     return r.lastNow;
+  }
+
+  function now() {
+    return familyNow(state.root);
   }
 
   function effectiveDraw(node) {
@@ -183,8 +187,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   // Pure plan: fills seg.own / seg.links and returns total pool need. A
   // member slice larger than that gate's own limit simply borrows the excess
   // up the chain — member limits never cap a combo, only the root pool does.
-  function planGather(segs) {
-    const r = state.root;
+  function planGather(r, segs) {
     const claimed = new Map();
     let poolNeed = 0;
     for (const seg of segs) {
@@ -219,7 +222,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
 
   // Apply a planned reservation; the caller pre-checked poolNeed against room.
   function applyGather(entry, segs) {
-    const r = entry.owner.root;
+    const r = entry.family;
     const gen = r.poolGen;
     for (const seg of segs) {
       const m = seg.gate;
@@ -252,9 +255,11 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   // are partitions OF the pool, not capacity beyond it. Feasibility is
   // therefore simply poolUsed + total combo units <= poolLimit; the plan's
   // own/lender/pool partition only decides which own window each unit lands
-  // on (and thus where its flip reclaims it).
+  // on (and thus where its flip reclaims it). The pool is the one of the
+  // family the entry queued in, which may differ from the owner's current
+  // family after a reparent split them apart.
   function tryGather(entry, segs) {
-    const r = entry.owner.root;
+    const r = entry.family;
     let total = 0;
     for (const seg of segs) total += seg.units;
     if (r.poolUsed + total > r.poolLimit) {
@@ -264,7 +269,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
       }
       return false;
     }
-    planGather(segs);
+    planGather(r, segs);
     applyGather(entry, segs);
     return true;
   }
@@ -282,7 +287,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   // reclaimed it (the link is marked released and its gen is stale).
   function releaseHolds(entry) {
     if (!entry.holdsHeld || entry.segs === null) return;
-    const r = entry.owner.root;
+    const r = entry.family;
     for (const seg of entry.segs) {
       const m = seg.gate;
       if (!seg.ownReleased && seg.own > 0) {
@@ -356,7 +361,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   // occupations. Pool room was charged at gather time, so poolUsed does not
   // move here.
   function commitCombo(entry) {
-    const r = entry.owner.root;
+    const r = entry.family;
     const records = [];
     const lenderCleanup = new Set();
     for (const seg0 of entry.segs) {
@@ -431,12 +436,15 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   }
 
   // One queue entry leaves the queue exactly once, and exactly one of
-  // granted / refused / expired / cancelled moves as a result.
+  // granted / refused / expired / cancelled moves as a result. The queue
+  // bookkeeping belongs to the family the entry queued in (entry.family);
+  // the terminal counter belongs to the entry-point gate (entry.owner).
+  // A reparent can split the two into different families, and each side of
+  // the accounting stays with its own gate.
   function settleEntry(entry, outcome) {
     if (entry.removed) return;
-    const ownerRoot = entry.owner.root;
     entry.removed = true;
-    ownerRoot.liveQueued -= 1;
+    entry.family.liveQueued -= 1;
     clearTimeout(entry.timer);
     detachSignal(entry);
     for (const charge of entry.waitCharges) charge.gate.waiting -= charge.units;
@@ -487,10 +495,13 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
   }
 
   // At the same moment expiry beats cancellation: an abort arriving once the
-  // deadline has already passed settles as WAIT_EXPIRED.
+  // deadline has already passed settles as WAIT_EXPIRED. The deadline was
+  // stamped by the clock of the family the entry queued in, so that is the
+  // clock the comparison uses — the owner's current family clock could
+  // disagree after a reparent.
   function onEntryAbort(entry) {
     if (entry.removed) return;
-    if (entry.deadline <= now()) {
+    if (entry.deadline <= familyNow(entry.family)) {
       settleEntry(entry, 'expired');
     } else {
       settleEntry(entry, 'cancelled');
@@ -940,6 +951,8 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
           entry.yields = 0;
           entry.blockG = -1;
         }
+        // Queue and pool bookkeeping now belong to the joined family.
+        entry.family = newRootState;
         movedEntries.push(entry);
         movedLive += 1;
       } else {
@@ -1117,6 +1130,13 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     const t = now();
     const entry = {
       owner,
+      // The family root whose queue and pool this entry belongs to, pinned
+      // at enqueue time. reparent() can move the owner gate — or every
+      // member gate — into another family afterwards; queue bookkeeping
+      // (liveQueued, pool reservations, the wait clock) stays with the
+      // family the entry actually sits in, while the terminal counters stay
+      // with the owner gate.
+      family: state.root,
       combo,
       units,
       resolve,

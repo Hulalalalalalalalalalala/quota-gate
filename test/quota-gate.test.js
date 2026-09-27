@@ -1276,3 +1276,106 @@ test('reparent refuses a combo split across the two families and moves a whole c
   assert.equal(newRoot.stats().granted + oldRoot.stats().granted, oldGranted + 1);
   h.release();
 });
+
+test('a split combo refused by reparent leaves the queue and blocks nobody behind it', async () => {
+  const oldRoot = createGate({ limit: 2, windowMs: 60, maxWaitMs: 5000 });
+  const a = createGate({ limit: 1, windowMs: 1000, maxWaitMs: 5000, parent: oldRoot });
+  const b = createGate({ limit: 1, windowMs: 1000, maxWaitMs: 5000, parent: oldRoot });
+  const newRoot = createGate({ limit: 2, windowMs: 60, maxWaitMs: 5000 });
+  await oldRoot.acquire(2); // old pool full
+  const pSplit = oldRoot.acquireAll([{ gate: a, units: 1 }, { gate: b, units: 1 }]); // queues
+  const pLater = oldRoot.acquire(1); // queued behind the combo
+  assert.equal(oldRoot.stats().rolledBack, 1); // the combo's first gather failed whole
+  a.reparent(newRoot); // splits the combo across the two families
+  await assert.rejects(pSplit, (err) => {
+    assert.ok(err instanceof QuotaExceededError);
+    assert.equal(err.code, 'QUOTA_EXCEEDED');
+    return true;
+  });
+  // The refusal is one synchronous cut: the combo is out of the queue, only
+  // the refusal counter moved, and the later request was not granted early.
+  assert.equal(oldRoot.stats().refused, 1);
+  assert.equal(oldRoot.stats().rolledBack, 1);
+  assert.equal(oldRoot.stats().waiting, 1);
+  assert.equal(oldRoot.stats().granted, 1);
+  const h = await pLater; // flows at the next window flip, never stuck
+  assert.equal(oldRoot.stats().granted, 2);
+  assert.equal(oldRoot.stats().waiting, 0);
+  h.release();
+});
+
+test('a queued combo whose entry gate leaves the family keeps its accounting in the old family', async () => {
+  const oldRoot = createGate({ limit: 2, windowMs: 60, maxWaitMs: 5000 });
+  const a = createGate({ limit: 2, windowMs: 1000, maxWaitMs: 5000, parent: oldRoot });
+  const b = createGate({ limit: 2, windowMs: 1000, maxWaitMs: 5000, parent: oldRoot });
+  const newRoot = createGate({ limit: 5, windowMs: 60, maxWaitMs: 5000 });
+  await oldRoot.acquire(2); // old pool full
+  const pCombo = a.acquireAll([{ gate: b, units: 1 }]); // entry gate a, member b: queues
+  assert.equal(a.stats().rolledBack, 1);
+  assert.equal(b.stats().waiting, 1); // the member carries the waiting slice
+  a.reparent(newRoot); // the entry gate leaves; every member stays
+  const h = await pCombo; // gathers and grants in the OLD family at its flip
+  // The terminal counter belongs to the entry gate, even though it now lives
+  // in another family; the member gate only carried the waiting slice.
+  assert.equal(a.stats().granted, 1);
+  assert.equal(b.stats().granted, 0);
+  assert.equal(b.stats().inFlight, 1);
+  assert.equal(b.stats().waiting, 0);
+  // Both families' queues are really empty afterwards: the next acquire on
+  // either side commits in the same cut instead of queueing behind a ghost.
+  const pOld = oldRoot.acquire(1); // 1 (combo) + 1 <= 2 in the old pool
+  assert.equal(oldRoot.stats().granted, 2);
+  const pNew = a.acquire(1);
+  assert.equal(a.stats().granted, 2);
+  const [hOld, hNew] = await Promise.all([pOld, pNew]);
+  h.release();
+  hOld.release();
+  hNew.release();
+});
+
+test('a combo migrating with its members keeps queue accounting in the joined family', async () => {
+  const oldRoot = createGate({ limit: 2, windowMs: 60, maxWaitMs: 5000 });
+  const a = createGate({ limit: 2, windowMs: 1000, maxWaitMs: 5000, parent: oldRoot });
+  const newRoot = createGate({ limit: 3, windowMs: 60, maxWaitMs: 5000 });
+  const h0 = await oldRoot.acquire(2); // old pool full
+  const pCombo = oldRoot.acquireAll([{ gate: a, units: 1 }]); // owner stays, member moves
+  a.reparent(newRoot); // the whole combo migrates into the new family's queue
+  const h = await pCombo; // gathers anew and grants at the NEW family's flip
+  assert.equal(oldRoot.stats().granted, 2); // the counter stays with the entry gate
+  assert.equal(a.stats().inFlight, 1);
+  // The joined family's queue is really empty: the next acquire commits in
+  // the same cut instead of queueing behind a ghost.
+  const pNew = newRoot.acquire(1); // 1 (combo) + 1 <= 3 in the new pool
+  assert.equal(newRoot.stats().granted, 1);
+  // The old family's queue is really empty too.
+  h0.release();
+  const pOld = oldRoot.acquire(1);
+  assert.equal(oldRoot.stats().granted, 3);
+  const [hNew, hOld] = await Promise.all([pNew, pOld]);
+  h.release();
+  hNew.release();
+  hOld.release();
+});
+
+test('a migrated combo releases its old-family reservation exactly once', async () => {
+  const oldRoot = createGate({ limit: 3, windowMs: 60, maxWaitMs: 5000 });
+  const a = createGate({ limit: 2, windowMs: 1000, maxWaitMs: 5000, parent: oldRoot });
+  const newRoot = createGate({ limit: 5, windowMs: 60, maxWaitMs: 5000 });
+  const h0 = await oldRoot.acquire(1); // old pool 1/3
+  const pSingle = oldRoot.acquire(3); // earlier arrival; 1+3>3, queues
+  const pCombo = oldRoot.acquireAll([{ gate: a, units: 2 }]); // 1+2=3 gathers, waits behind
+  assert.equal(a.stats().reserved, 2); // held in the old family
+  a.reparent(newRoot); // the whole combo migrates; the old-family hold is released
+  assert.equal(a.stats().reserved, 0);
+  assert.equal(oldRoot.stats().reserved, 0);
+  // The release happened exactly once: the old pool is back to 1/3 used, so
+  // a fresh 2-unit request still gathers (and queues behind the single).
+  const pMine = oldRoot.acquire(2);
+  assert.equal(oldRoot.stats().reserved, 2);
+  const [hCombo, hSingle, hMine] = await Promise.all([pCombo, pSingle, pMine]);
+  assert.equal(a.stats().inFlight, 2); // gathered anew in the joined family
+  h0.release();
+  hCombo.release();
+  hSingle.release();
+  hMine.release();
+});
