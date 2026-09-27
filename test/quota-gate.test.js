@@ -1,8 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { createGate, QuotaExceededError } from '../src/index.js';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const SRC_PATH = fileURLToPath(new URL('../src/index.js', import.meta.url));
+const PROJECT_ROOT = fileURLToPath(new URL('..', import.meta.url));
 
 test('stats exposes the documented keys in order', () => {
   const gate = createGate({ limit: 2, windowMs: 100 });
@@ -1603,3 +1607,222 @@ test('head withdrawals across many window flips keep releasing later arrivals', 
   assert.equal(root.stats().granted, granted * 2); // one h0 + one retried per cycle
   assert.equal(root.stats().waiting, 0);
 });
+
+// --- Failed-migration rollback and exact pool settlement ---------------------
+
+// A synchronous capacity probe: acquiring `units` with the zero wait cap
+// settles on the spot, so a granted/refused answer reads the family's pool
+// room without queuing. The probe occupation is released immediately.
+async function grantsNow(g, units) {
+  try {
+    const h = await g.acquire(units);
+    h.release();
+    return true;
+  } catch (err) {
+    if (err instanceof QuotaExceededError) return false;
+    throw err;
+  }
+}
+
+test('a rejected move after a lender flip leaves the old family readings untouched', async () => {
+  const oldRoot = createGate({ limit: 5, windowMs: 10000 });
+  const p = createGate({ limit: 2, windowMs: 40, parent: oldRoot });
+  const a = createGate({ limit: 2, windowMs: 10000, parent: p });
+  const occ = await a.acquire(4); // own 2 + 2 lent by p; the old pool charges 4
+  await sleep(70); // p's window flips: the 2 lent units are reclaimed, the pool charges 2
+  const newRoot = createGate({ limit: 3, windowMs: 10000 });
+  // The full occupation (4 units) cannot fit the joined pool (3 free), so the
+  // move is rejected even though only 2 units are still charged in the old
+  // pool. Nothing is refunded or charged.
+  await assert.throws(
+    () => a.reparent(newRoot),
+    (err) => err instanceof QuotaExceededError && err.code === 'QUOTA_EXCEEDED',
+  );
+  // The old family still has exactly 3 free (5 minus the member's own 2):
+  // neither an extra deduction nor a reverse release.
+  assert.equal(await grantsNow(oldRoot, 3), true);
+  const other = createGate({ limit: 5, windowMs: 40, parent: oldRoot });
+  assert.equal(await grantsNow(other, 3), false); // a fresh pool window: still capped at 5
+  assert.equal(a.stats().inFlight, 2); // the reclaimed borrow did not move
+  occ.release();
+});
+
+test('a feasible move after a lender flip refunds the old pool and charges the new one exactly', async () => {
+  const oldRoot = createGate({ limit: 5, windowMs: 10000 });
+  const p = createGate({ limit: 2, windowMs: 40, parent: oldRoot });
+  const a = createGate({ limit: 2, windowMs: 10000, parent: p });
+  const occ = await a.acquire(4); // own 2 + 2 lent
+  await sleep(70); // p flips: only the own 2 still charge the old pool
+  const newRoot = createGate({ limit: 10, windowMs: 10000 });
+  a.reparent(newRoot);
+  // The occupation moves in full: the joined pool charges all 4 of its units,
+  // never the stale cached 4 the old pool no longer charges.
+  assert.equal(a.stats().inFlight, 4); // whole occupation restored against the new chain
+  assert.equal(p.stats().inFlight, 0); // the reclaimed lend stays settled
+  assert.equal(await grantsNow(newRoot, 6), true); // 10 - 4 free
+  const oldRoot2 = createGate({ limit: 5, windowMs: 10000 });
+  const p2 = createGate({ limit: 2, windowMs: 40, parent: oldRoot2 });
+  const a2 = createGate({ limit: 2, windowMs: 10000, parent: p2 });
+  await a2.acquire(4);
+  await sleep(70);
+  const newRoot2 = createGate({ limit: 10, windowMs: 10000 });
+  a2.reparent(newRoot2);
+  assert.equal(await grantsNow(newRoot2, 7), false); // no reverse admission beyond the cap
+  assert.equal(await grantsNow(oldRoot2, 5), true); // the moving own 2 freed the old pool
+  occ.release();
+});
+
+test('a move after a pool flip still charges the joined pool for the whole occupation', async () => {
+  const oldRoot = createGate({ limit: 5, windowMs: 40 });
+  const a = createGate({ limit: 2, windowMs: 10000, parent: oldRoot });
+  const occ = await a.acquire(2); // charges the old pool 2
+  await sleep(70); // the pool flips and reclaims both units
+  const newRoot = createGate({ limit: 5, windowMs: 10000 });
+  a.reparent(newRoot);
+  assert.equal(a.stats().inFlight, 2); // occupation intact
+  assert.equal(await grantsNow(newRoot, 3), true); // joined pool charges the live occupation
+  const oldRoot2 = createGate({ limit: 5, windowMs: 40 });
+  const a2 = createGate({ limit: 2, windowMs: 10000, parent: oldRoot2 });
+  await a2.acquire(2);
+  await sleep(70);
+  const newRoot2 = createGate({ limit: 5, windowMs: 10000 });
+  a2.reparent(newRoot2);
+  assert.equal(await grantsNow(newRoot2, 4), false); // the stale empty draw is not reused
+  assert.equal(await grantsNow(oldRoot2, 5), true); // nothing of it remains in the old pool
+  occ.release();
+});
+
+test('a failed move followed by an equal-size request matches the pre-move readings', async () => {
+  const oldRoot = createGate({ limit: 3, windowMs: 10000 });
+  const a = createGate({ limit: 2, windowMs: 10000, parent: oldRoot });
+  const newRoot = createGate({ limit: 2, windowMs: 10000 });
+  const occ = await a.acquire(2); // subtree needs 2; only 1 is free in the new pool
+  await newRoot.acquire(1);
+  const before = [oldRoot.stats(), a.stats(), newRoot.stats()];
+  assert.throws(
+    () => a.reparent(newRoot),
+    (err) => err instanceof QuotaExceededError && err.code === 'QUOTA_EXCEEDED',
+  );
+  // Throwing the quota error changed not one reading of any family.
+  assert.deepEqual([oldRoot.stats(), a.stats(), newRoot.stats()], before);
+  // The equal-size follow-up behaves exactly as before the failed move: the
+  // one remaining old-pool unit is granted, the next is refused.
+  const follow = await oldRoot.acquire(1);
+  assert.equal(oldRoot.stats().granted, before[0].granted + 1);
+  await assert.rejects(oldRoot.acquire(1), (err) => err.code === 'QUOTA_EXCEEDED');
+  assert.equal(oldRoot.stats().refused, before[0].refused + 1);
+  follow.release();
+  occ.release();
+});
+
+test('after a failed move the fitting queued prefix still flows in arrival order', async () => {
+  const oldRoot = createGate({ limit: 3, windowMs: 10000, maxWaitMs: 5000 });
+  const a = createGate({ limit: 2, windowMs: 10000, maxWaitMs: 5000, parent: oldRoot });
+  const newRoot = createGate({ limit: 2, windowMs: 10000 });
+  await a.acquire(2);
+  await newRoot.acquire(1); // makes the move infeasible
+  const order = [];
+  // A head that cannot gather (2+2>3), then a request the pool can cover.
+  const ac = new AbortController();
+  const pHead = oldRoot.acquire(2, ac.signal).then(
+    () => { order.push('head'); },
+    (e) => { order.push(e.code); },
+  );
+  const p1 = oldRoot.acquire(1).then((h) => { order.push(1); return h; });
+  let failed = false;
+  try { a.reparent(newRoot); } catch (err) { failed = err instanceof QuotaExceededError; }
+  assert.equal(failed, true);
+  // The failed move neither drains nor wedges the queue; the head is still the
+  // barrier and the assembled follower is not granted early.
+  await sleep(20);
+  assert.deepEqual(order, []);
+  ac.abort(); // the blocked head withdraws
+  // Its withdrawal cuts the fitting follower loose in the same cut.
+  const h1 = await p1;
+  await pHead;
+  assert.deepEqual(order, ['CANCELLED', 1]); // head left first, follower then flowed
+  h1.release();
+});
+
+// --- Real-time wait settlement in an idle process ----------------------------
+
+// Run a script in a fresh process whose event loop has nothing else pending.
+// A queued wait must settle on real elapsed time and the process must stay
+// alive until that settlement (the window timer alone must not be the only
+// thing keeping it alive, nor may a detached wait timer let it exit early).
+function runIdle(script, { timeoutMs = 5000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      process.execPath,
+      ['--input-type=module', '-e', script],
+      { cwd: PROJECT_ROOT },
+    );
+    let out = '';
+    let err = '';
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error('idle script timed out'));
+    }, timeoutMs);
+    child.stdout.on('data', (d) => { out += d; });
+    child.stderr.on('data', (d) => { err += d; });
+    child.on('error', reject);
+    child.on('exit', (code, signal) => {
+      clearTimeout(timer);
+      if (signal) reject(new Error(`idle script killed by ${signal}\n${err}`));
+      else resolve({ code, out: out.trim(), err: err.trim() });
+    });
+  });
+}
+
+test('a queued wait expires on real time in an otherwise idle process', async () => {
+  const { code, out, err } = await runIdle(`
+    import { createGate } from ${JSON.stringify(SRC_PATH)};
+    const gate = createGate({ limit: 1, windowMs: 60000, maxWaitMs: 40 });
+    await gate.acquire(1);
+    const t0 = Date.now();
+    try {
+      await gate.acquire(1);
+      console.log('GRANTED');
+    } catch (e) {
+      console.log(JSON.stringify({ code: e.code, elapsed: Date.now() - t0, expired: gate.stats().expired }));
+    }
+  `);
+  assert.equal(code, 0, err);
+  const result = JSON.parse(out);
+  assert.equal(result.code, 'WAIT_EXPIRED');
+  assert.equal(result.expired, 1);
+  // Real time: not the ~1ms a clamped overflow timer would give.
+  assert.ok(result.elapsed >= 35, `expired too early: ${result.elapsed}ms`);
+});
+
+test('a wait cap beyond the 32-bit timer range settles on real time when idle', async () => {
+  // The cap cannot be waited out in full within the test, so assert the
+  // process stays alive well past the overflowed-1ms point and then settles as
+  // CANCELLED when aborted, rather than expiring almost immediately.
+  const { code, out, err } = await runIdle(`
+    import { createGate } from ${JSON.stringify(SRC_PATH)};
+    const gate = createGate({ limit: 1, windowMs: 60000, maxWaitMs: 3000000000 });
+    await gate.acquire(1);
+    const ac = new AbortController();
+    const p = gate.acquire(1, ac.signal).then(() => 'GRANTED', (e) => e.code);
+    setTimeout(() => ac.abort(), 50);
+    console.log(await p);
+  `);
+  assert.equal(code, 0, err);
+  assert.equal(out, 'CANCELLED'); // alive at 50ms; no premature WAIT_EXPIRED
+});
+
+test('expiry beats cancellation at the same moment in real time', async () => {
+  const { code, out, err } = await runIdle(`
+    import { createGate } from ${JSON.stringify(SRC_PATH)};
+    const gate = createGate({ limit: 1, windowMs: 60000, maxWaitMs: 30 });
+    await gate.acquire(1);
+    const ac = new AbortController();
+    const p = gate.acquire(1, ac.signal).then(() => 'GRANTED', (e) => e.code);
+    setTimeout(() => ac.abort(), 30); // abort lands on the deadline
+    console.log(await p);
+  `);
+  assert.equal(code, 0, err);
+  assert.equal(out, 'WAIT_EXPIRED');
+});
+

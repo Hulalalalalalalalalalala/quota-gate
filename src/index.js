@@ -72,8 +72,6 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     inFlight: 0, // units occupied through this gate and not yet cleared
     borrowedInFlight: 0, // units this gate's occupations borrowed, still live
     lentInFlight: 0, // own units lent to descendants' admitted occupations
-    poolDraw: 0, // committed pool charge, valid only when drawGen === poolGen
-    drawGen: -1,
     // Cross-gate reservation accounting. A pending acquireAll first reserves
     // the member's own current-window slice, then own slices up the direct
     // parent chain (each step registering the lend); the root pool covers the
@@ -143,18 +141,6 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     const t = Date.now();
     if (t > r.lastNow) r.lastNow = t;
     return r.lastNow;
-  }
-
-  function effectiveDraw(node) {
-    return node.drawGen === node.root.poolGen ? node.poolDraw : 0;
-  }
-
-  function chargeDraw(node, units) {
-    if (node.drawGen !== node.root.poolGen) {
-      node.drawGen = node.root.poolGen;
-      node.poolDraw = 0;
-    }
-    node.poolDraw += units;
   }
 
   function reservedOn(g) {
@@ -372,7 +358,6 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     for (const seg0 of entry.segs) {
       const m = seg0.gate;
       const units = seg0.units;
-      chargeDraw(m, units);
       let seg;
       if (m === r) {
         // The root member's whole slice is its own window and drew the pool
@@ -384,7 +369,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
         m.usedOwn += units;
         m.inFlight += units;
         m.resvAsMember.delete(entry);
-        seg = { member: m, units, own: units, mgen: m.ownGen, links: [] };
+        seg = { member: m, units, own: units, mgen: m.ownGen, pgen: r.poolGen, links: [] };
       } else {
         const ownPart = seg0.own;
         m.usedOwn += ownPart;
@@ -417,7 +402,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
           links.push(link);
         }
         m.borrowedInFlight += units - ownPart;
-        seg = { member: m, units, own: ownPart, mgen: m.ownGen, links };
+        seg = { member: m, units, own: ownPart, mgen: m.ownGen, pgen: r.poolGen, links };
       }
       const rec = { seg };
       m.openHandles.add(rec);
@@ -553,7 +538,10 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
       // behind it in the same event-loop tick.
       drainHeld(r);
     }, chunk);
-    if (typeof entry.timer.unref === 'function') entry.timer.unref();
+    // The wait timer is intentionally left referenced: expiry is settled by
+    // real elapsed time even when the event loop has nothing else to do, and a
+    // pending waiter must keep an otherwise-idle process alive until its
+    // deadline lands (settleEntry clears the timer when the entry leaves).
   }
 
   // At the same moment expiry beats cancellation: an abort arriving once the
@@ -754,8 +742,8 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     r.borrowedInFlight = 0;
     r.lentInFlight = 0;
 
-    // The pool window resets. Committed poolDraw is generation-tagged, so no
-    // family-wide sweep is needed.
+    // The pool window resets. The outstanding links and reservations above
+    // were already reclaimed in this same flip, so the pool just reopens.
     r.poolGen += 1;
     r.poolUsed = 0;
 
@@ -919,57 +907,92 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
     return false;
   }
 
+  // Exact pool charge one admitted segment currently carries in the OLD pool,
+  // and the charge it must carry in the NEW pool after the move. The whole
+  // occupation is still alive (handles never break), so the joined pool
+  // charges every one of its units (moveIn === seg.units). The old pool only
+  // refunds what its CURRENT window is still charging: the member own slice
+  // tagged at commit, live pool links, and live ancestor lends whose pool
+  // charge was never reclaimed by either the lender's flip or a pool flip.
+  function segmentMoveCharges(seg, oldRootState) {
+    let moveOut = 0;
+    if (seg.pgen === oldRootState.poolGen) moveOut += seg.own;
+    for (const link of seg.links) {
+      if (link.kind === 'pool') {
+        if (link.lgen === oldRootState.poolGen) moveOut += link.units;
+      } else if (link.lgen === link.lender.ownGen && link.pgen === oldRootState.poolGen) {
+        moveOut += link.units;
+      }
+    }
+    return { moveOut, moveIn: seg.units };
+  }
+
   // Rebuild the borrow side of one admitted occupation segment after its
   // member moved into a new family. The member's own slice and handle survive
   // (a former root turned child keeps only its limit-sized own slice); every
   // old link is detached, settling live sides, and the borrowed remainder is
   // drawn from the new family's pool directly — the same flat partition a
-  // single-gate occupation always used. The bulk pool charge moved once with
-  // the subtree (subtreeDraw), so this function moves no poolUsed.
+  // single-gate occupation always used. The caller moves exactly the returned
+  // old/new pool charges, so this function itself moves no poolUsed.
   function reborrowSeg(seg, oldRootState, newRootState) {
+    const { moveOut, moveIn } = segmentMoveCharges(seg, oldRootState);
     const m = seg.member;
+    // This segment's links still counted on the member right now. A link a
+    // window flip already reclaimed was subtracted from m then and must not be
+    // subtracted again here; the post-move target restores the whole
+    // occupation against the new windows regardless.
+    let liveLinkUnits = 0;
     for (const link of seg.links) {
       if (link.kind === 'pool') {
         oldRootState.poolLinks.delete(link);
-      } else if (link.lgen === link.lender.ownGen) {
-        // The lend leaves the old family with the moving occupation: settle
-        // its lender side as well as the occupation side.
-        const g = link.lender;
-        g.lentLinks.delete(link);
-        g.usedOwn -= link.units;
-        g.inFlight -= link.units;
-        g.lentInFlight -= link.units;
-      }
-      if (link.mgen === m.ownGen) {
-        m.inFlight -= link.units;
-        m.borrowedInFlight -= link.units;
+        if (link.lgen === oldRootState.poolGen) liveLinkUnits += link.units;
+      } else {
+        if (link.lgen === link.lender.ownGen) {
+          // The lend leaves the old family with the moving occupation: settle
+          // its lender side (the lender may be a moved ancestor or a gate
+          // staying behind — neither keeps the lend after the chain changes).
+          const g = link.lender;
+          g.lentLinks.delete(link);
+          g.usedOwn -= link.units;
+          g.inFlight -= link.units;
+          g.lentInFlight -= link.units;
+          liveLinkUnits += link.units;
+        }
       }
     }
     seg.links = [];
 
-    let ownPart = seg.own;
+    // Current member-side counters (member own window is still open: a member
+    // whose window flipped lost this rec from openHandles and is not migrated):
+    // inFlight = committed own slice + every still-live link; borrowedInFlight
+    // = the live links alone. Restore both toward the new flat partition.
+    const committedOwn = seg.own;
+    let ownPart = committedOwn;
     if (m === oldRootState) {
       // A former root counted the whole occupation as its own; as a child only
-      // its limit-sized slice stays own, and inFlight must not change.
+      // its limit-sized slice stays own; inFlight itself never moves.
       ownPart = Math.min(seg.units, m.limit);
       m.usedOwn -= seg.units - ownPart;
       seg.own = ownPart;
     }
-    const need = seg.units - ownPart;
-    if (need > 0) {
+    const targetBorrowed = seg.units - ownPart;
+    if (m !== oldRootState) {
+      m.inFlight += seg.units - committedOwn - liveLinkUnits;
+    }
+    m.borrowedInFlight += targetBorrowed - liveLinkUnits;
+    if (targetBorrowed > 0) {
       const link = {
         kind: 'pool',
         lender: newRootState,
         member: m,
-        units: need,
+        units: targetBorrowed,
         lgen: newRootState.poolGen,
         mgen: m.ownGen,
       };
       newRootState.poolLinks.add(link);
       seg.links.push(link);
-      m.borrowedInFlight += need;
-      if (m !== oldRootState) m.inFlight += need;
     }
+    return { moveOut, moveIn };
   }
 
   // Release provisional links of a staying queued combo whose lender (or whose
@@ -1121,10 +1144,30 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
       }
 
       // Capacity is decided before anything settles, so a rejected move rolls
-      // back trivially with no cut at all.
-      let subtreeDraw = 0;
-      for (const node of moved) subtreeDraw += effectiveDraw(node);
-      if (newRootState.poolUsed + subtreeDraw > newRootState.poolLimit) {
+      // back trivially with no cut at all. The joined pool must cover every
+      // unit of every admitted occupation carried by a moving member — whole
+      // occupations stay alive and move in full — while the old pool refunds
+      // only the units its current window is still charging. Window flips
+      // already reclaimed the difference, so the counts follow the live
+      // segments rather than a cached full charge.
+      const movingSegs = [];
+      const seenSegs = new Set();
+      for (const node of moved) {
+        for (const rec of node.openHandles) {
+          if (moved.has(rec.seg.member) && !seenSegs.has(rec.seg)) {
+            seenSegs.add(rec.seg);
+            movingSegs.push(rec.seg);
+          }
+        }
+      }
+      const segPlans = movingSegs.map((seg) => segmentMoveCharges(seg, oldRootState));
+      let moveInTotal = 0;
+      let moveOutTotal = 0;
+      for (const plan of segPlans) {
+        moveInTotal += plan.moveIn;
+        moveOutTotal += plan.moveOut;
+      }
+      if (newRootState.poolUsed + moveInTotal > newRootState.poolLimit) {
         throw new QuotaExceededError(
           'QUOTA_EXCEEDED',
           'cannot reparent: the new family pool cannot cover the borrowed quota',
@@ -1140,13 +1183,12 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
 
       // Settle the admitted borrow in the old pool, re-borrow from the new one.
       const oldDirectParent = state.parent;
-      oldRootState.poolUsed -= subtreeDraw;
-      newRootState.poolUsed += subtreeDraw;
+      oldRootState.poolUsed -= moveOutTotal;
+      newRootState.poolUsed += moveInTotal;
       for (const node of moved) {
         oldRootState.members.delete(node);
         newRootState.members.add(node);
         node.root = newRootState;
-        node.drawGen = newRootState.poolGen; // the draw now counts in the new pool
       }
       // Re-link the tree FIRST, so borrow walks below traverse the NEW chain.
       if (oldDirectParent !== null) oldDirectParent.children.delete(state);
@@ -1159,15 +1201,7 @@ export function createGate({ limit, windowMs, maxWaitMs = 0, parent } = {}) {
       }
       // Outstanding occupations keep running with the very same handles;
       // only their borrow links are rebuilt against the new ancestor chain.
-      const processedSegs = new Set();
-      for (const node of moved) {
-        for (const rec of node.openHandles) {
-          if (moved.has(rec.seg.member) && !processedSegs.has(rec.seg)) {
-            processedSegs.add(rec.seg);
-            reborrowSeg(rec.seg, oldRootState, newRootState);
-          }
-        }
-      }
+      for (const seg of movingSegs) reborrowSeg(seg, oldRootState, newRootState);
       migrateQueue(oldRootState, newRootState, moved);
       // The moved waiters carry deadlines stamped by the old family clock;
       // make the joined clock at least as large so the monotonic guarantee
